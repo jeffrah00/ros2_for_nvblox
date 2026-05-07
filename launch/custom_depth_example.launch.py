@@ -197,9 +197,7 @@ def generate_launch_description() -> LaunchDescription:
             condition=IfCondition(lu.has_substring(args.mode, NvbloxMode.people_detection))))
 
     # nvblox: when depth_source=custom, route its depth subscription to the
-    # custom node's output topic via SetRemap. Visualization is wrapped in the
-    # same GroupActions so RViz picks the custom depth topic automatically
-    # without manual topic switching.
+    # custom node's output topic via SetRemap.
     def _nvblox_include():
         return lu.include(
             'nvblox_examples_bringup',
@@ -211,27 +209,16 @@ def generate_launch_description() -> LaunchDescription:
                 'num_cameras': args.num_cameras,
             })
 
-    def _visualization_include():
-        return lu.include(
-            'nvblox_examples_bringup',
-            'launch/visualization/visualization.launch.py',
-            launch_arguments={
-                'mode': args.mode,
-                'camera': camera_mode,
-                'use_foxglove_whitelist': args.use_foxglove_whitelist,
-            })
-
     actions.append(GroupAction(
         actions=[
             SetRemap(src='/camera0/depth/image_rect_raw', dst=args.custom_output_depth_topic),
             SetRemap(src='/camera0/depth/camera_info', dst=args.custom_output_camera_info_topic),
             _nvblox_include(),
-            _visualization_include(),
         ],
         condition=LaunchConfigurationEquals('depth_source', 'custom')))
 
     actions.append(GroupAction(
-        actions=[_nvblox_include(), _visualization_include()],
+        actions=[_nvblox_include()],
         condition=LaunchConfigurationEquals('depth_source', 'realsense')))
 
     actions.append(
@@ -244,6 +231,16 @@ def generate_launch_description() -> LaunchDescription:
             bag_path=args.rosbag,
             additional_bag_play_args=args.rosbag_args,
             condition=IfCondition(lu.is_valid(args.rosbag))))
+
+    actions.append(
+        lu.include(
+            'nvblox_examples_bringup',
+            'launch/visualization/visualization.launch.py',
+            launch_arguments={
+                'mode': args.mode,
+                'camera': camera_mode,
+                'use_foxglove_whitelist': args.use_foxglove_whitelist,
+            }))
 
     # Custom stereo-depth node. Build the cmd at evaluation time and skip empty
     # params (rcl rejects `-p name:=` with no value).
