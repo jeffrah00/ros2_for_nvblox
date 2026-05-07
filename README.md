@@ -70,8 +70,8 @@ The S2M2 node subscribes (defaults are RealSense D435i IR; override via the args
 | in        | `/camera0/infra1/image_rect_raw`                  | left IR (mono8 OK; auto-converted to 3ch) |
 | in        | `/camera0/infra2/image_rect_raw`                  | right IR |
 | in        | `/camera0/infra1/camera_info`                     | left CameraInfo |
-| out       | `/camera0/depth/image_rect_raw` (`32FC1`, meters) | nvblox subscribes here |
-| out       | `/camera0/depth/camera_info`                      |       |
+| out       | `/s2m2/depth/image_rect_raw` (`32FC1`, meters)    | distinguishable from RealSense splitter's `/camera0/depth/...`; nvblox is remapped to it |
+| out       | `/s2m2/depth/camera_info`                         |       |
 
 For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.05`, which is the default). Verify against your unit's calibration.
 
@@ -87,8 +87,8 @@ For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.0
 | `s2m2_left_topic` | `/camera0/infra1/image_rect_raw` | RealSense D435i IR1 by default |
 | `s2m2_right_topic` | `/camera0/infra2/image_rect_raw` | RealSense D435i IR2 by default |
 | `s2m2_camera_info_topic` | `/camera0/infra1/camera_info` | left CameraInfo |
-| `s2m2_output_depth_topic` | `/camera0/depth/image_rect_raw` | nvblox subscribes here |
-| `s2m2_output_camera_info_topic` | `/camera0/depth/camera_info` | |
+| `s2m2_output_depth_topic` | `/s2m2/depth/image_rect_raw` | nvblox is remapped to this |
+| `s2m2_output_camera_info_topic` | `/s2m2/depth/camera_info` | |
 | `s2m2_width` | `0` | inference width; `0` = crop to nearest /32. Must be divisible by 32. |
 | `s2m2_height` | `0` | inference height; same rule. |
 | `s2m2_baseline_m` | `0.05` | stereo baseline in meters (left CameraInfo doesn't carry it) |
@@ -100,5 +100,5 @@ For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.0
 - **All-zero or wildly wrong depth** — set `s2m2_baseline_m` to your actual stereo baseline in meters. The left CameraInfo's projection matrix typically does not encode it.
 - **Shape error from S2M2** — make `s2m2_width`/`s2m2_height` divisible by 32, or leave them as `0` and let the node auto-crop.
 - **TensorRT shape mismatch** — re-export the engine at the exact `s2m2_height`/`s2m2_width` you launch with.
-- **nvblox reports no depth** — confirm `/camera0/depth/image_rect_raw` matches your nvblox version's expected depth topic; if not, override `s2m2_output_depth_topic` (and `s2m2_output_camera_info_topic`) accordingly.
+- **nvblox reports no depth** — confirm the launch file's `SetRemap` source (`/camera0/depth/image_rect_raw`) matches your nvblox version's expected depth topic. The S2M2 node publishes to `/s2m2/depth/...` and the remap routes nvblox to it; override `s2m2_output_depth_topic` / `s2m2_output_camera_info_topic` to publish under a different name.
 - **Sync drops** — loosen the `ApproximateTimeSynchronizer` slop in `s2m2_depth_node.py` or align timestamps in your bag.

@@ -103,8 +103,12 @@ def generate_launch_description() -> LaunchDescription:
                  description='Right rectified stereo image. D435i IR2 by default.', cli=True)
     args.add_arg('s2m2_camera_info_topic', '/camera0/infra1/camera_info',
                  description='CameraInfo for the left image. D435i IR1 by default.', cli=True)
-    args.add_arg('s2m2_output_depth_topic', '/camera0/depth/image_rect_raw', cli=True)
-    args.add_arg('s2m2_output_camera_info_topic', '/camera0/depth/camera_info', cli=True)
+    args.add_arg('s2m2_output_depth_topic', '/s2m2/depth/image_rect_raw',
+                 description='Where the S2M2 node publishes depth. nvblox is remapped here.',
+                 cli=True)
+    args.add_arg('s2m2_output_camera_info_topic', '/s2m2/depth/camera_info',
+                 description='Where the S2M2 node publishes the matching CameraInfo.',
+                 cli=True)
     args.add_arg('s2m2_width', 0,
                  description='Inference width. 0 = crop to nearest /32. Must be divisible by 32 if set.',
                  cli=True)
