@@ -20,8 +20,9 @@ import os
 from isaac_ros_launch_utils.all_types import *
 import isaac_ros_launch_utils as lu
 
-from launch.actions import GroupAction, ExecuteProcess
+from launch.actions import GroupAction, ExecuteProcess, OpaqueFunction
 from launch.conditions import LaunchConfigurationEquals
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import SetRemap
 
 from nvblox_ros_python_utils.nvblox_launch_utils import NvbloxMode, NvbloxCamera, NvbloxPeopleSegmentation
@@ -262,26 +263,27 @@ def generate_launch_description() -> LaunchDescription:
             }))
 
     # S2M2 stereo-depth node. Run as a plain Python script so this repo stays
-    # package-free; ROS params are forwarded via --ros-args.
+    # package-free; ROS params are forwarded via --ros-args. Empty string params
+    # are skipped because `-p name:=` (no value) is rejected by rcl.
     s2m2_script = os.path.join(os.path.dirname(__file__), 's2m2_depth_node.py')
-    actions.append(ExecuteProcess(
-        cmd=['python3', s2m2_script,
-             '--ros-args',
-             '-p', ['model_type:=', args.s2m2_model_type],
-             '-p', ['num_refine:=', args.s2m2_num_refine],
-             '-p', ['weights_path:=', args.s2m2_weights_path],
-             '-p', ['engine_path:=', args.s2m2_engine_path],
-             '-p', ['left_topic:=', args.s2m2_left_topic],
-             '-p', ['right_topic:=', args.s2m2_right_topic],
-             '-p', ['camera_info_topic:=', args.s2m2_camera_info_topic],
-             '-p', ['output_depth_topic:=', args.s2m2_output_depth_topic],
-             '-p', ['output_camera_info_topic:=', args.s2m2_output_camera_info_topic],
-             '-p', ['width:=', args.s2m2_width],
-             '-p', ['height:=', args.s2m2_height],
-             '-p', ['baseline_m:=', args.s2m2_baseline_m],
-             '-p', ['confidence_threshold:=', args.s2m2_confidence_threshold],
-             '-p', ['device:=', args.s2m2_device]],
-        output='screen',
+
+    def _build_s2m2_proc(context, *_):
+        param_names = [
+            'model_type', 'num_refine', 'weights_path', 'engine_path',
+            'left_topic', 'right_topic', 'camera_info_topic',
+            'output_depth_topic', 'output_camera_info_topic',
+            'width', 'height', 'baseline_m', 'confidence_threshold', 'device',
+        ]
+        cmd = ['python3', s2m2_script, '--ros-args']
+        for name in param_names:
+            value = LaunchConfiguration(f's2m2_{name}').perform(context)
+            if value == '':
+                continue
+            cmd.extend(['-p', f'{name}:={value}'])
+        return [ExecuteProcess(cmd=cmd, output='screen')]
+
+    actions.append(GroupAction(
+        actions=[OpaqueFunction(function=_build_s2m2_proc)],
         condition=LaunchConfigurationEquals('depth_source', 's2m2')))
 
     # Container
