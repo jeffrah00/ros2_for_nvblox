@@ -1,9 +1,10 @@
 # ros2_depth_for_nvblox
 
-Two ROS 2 launch files that drive [Isaac ROS nvblox](https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nvblox):
+Three ROS 2 launch files that drive [Isaac ROS nvblox](https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nvblox):
 
 - **`realsense_example.launch.py`** — depth comes from a RealSense camera's onboard stereo module (default Isaac ROS nvblox example).
 - **`s2m2_example.launch.py`** — depth comes from the [S2M2](https://github.com/junhong-3dv/s2m2) stereo-matching network running on a stereo image pair. Defaults are wired to a RealSense D435i's two IR cameras (`/camera0/infra1`, `/camera0/infra2`); the topic names are launch args so any other stereo source works too. Everything downstream (vSLAM, nvblox, visualization) is identical.
+- **`custom_depth_example.launch.py`** — model-agnostic version of the S2M2 example. Loads any stereo network from an **ONNX `.onnx`** file (via `onnxruntime-gpu`) or a pre-built **TensorRT `.engine`**. Use this when you have pretrained weights from any other repo: export them to ONNX once and you're done.
 
 ## Prerequisites
 
@@ -11,6 +12,7 @@ Two ROS 2 launch files that drive [Isaac ROS nvblox](https://github.com/NVIDIA-I
 - CUDA-enabled GPU + PyTorch (matching the CUDA version on your machine).
 - Python deps: `cv_bridge`, `message_filters` (already pulled in by Isaac ROS), `opencv-python`, `numpy`.
 - For the TensorRT path: `tensorrt`, `pycuda`.
+- For the generic `custom_depth_example.launch.py` ONNX path: `onnxruntime-gpu` (`pip install onnxruntime-gpu`).
 
 ## Install S2M2
 
@@ -94,6 +96,33 @@ For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.0
 | `s2m2_baseline_m` | `0.05` | stereo baseline in meters (left CameraInfo doesn't carry it) |
 | `s2m2_confidence_threshold` | `0.0` | mask depth where conf < threshold; `0` disables |
 | `s2m2_device` | `cuda` | `cuda` or `cpu` |
+
+## Generic example (`custom_depth_example.launch.py`)
+
+Same pipeline as the S2M2 example, but the depth node loads an ONNX or TensorRT export of *any* stereo-matching model. Most upstream repos (S2M2 included) ship an ONNX export script — export your pretrained weights once and run.
+
+```bash
+# Export your model to ONNX (S2M2 shown; other repos have similar scripts):
+python s2m2/export_onnx.py \
+    --model_type S --weights_dir ./weights/S \
+    --height 384 --width 640 \
+    --output stereo_S_384x640.onnx
+
+# Run nvblox with the ONNX model:
+ros2 launch custom_depth_example.launch.py \
+    custom_onnx_path:=/abs/path/to/stereo_S_384x640.onnx \
+    custom_height:=384 custom_width:=640 \
+    custom_baseline_m:=0.05
+
+# Or with a TensorRT engine (faster):
+ros2 launch custom_depth_example.launch.py \
+    custom_engine_path:=/abs/path/to/stereo_S_384x640.engine \
+    custom_height:=384 custom_width:=640
+```
+
+The generic node assumes the model takes **two inputs** `(1, 3, H, W)` (left, right; float32 in `[0,1]` by default — set `custom_input_scale:=1.0` for raw uint8) and returns **1, 2, or 3 outputs** in order: disparity `(1, H, W)`, optional occlusion mask, optional confidence map. If your model has different conventions, re-export to match.
+
+Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/depth/camera_info`; nvblox is remapped to those via the launch file's `SetRemap`. All other launch args mirror the S2M2 example with a `custom_` prefix instead of `s2m2_`.
 
 ## Troubleshooting
 
