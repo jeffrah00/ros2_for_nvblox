@@ -94,9 +94,14 @@ def generate_launch_description() -> LaunchDescription:
     args.add_arg('s2m2_engine_path', '',
                  description='TensorRT .engine path. If set, takes priority over weights_path.',
                  cli=True)
-    args.add_arg('s2m2_left_topic', '/stereo/left/image_rect', cli=True)
-    args.add_arg('s2m2_right_topic', '/stereo/right/image_rect', cli=True)
-    args.add_arg('s2m2_camera_info_topic', '/stereo/left/camera_info', cli=True)
+    # Defaults match RealSense D435/D435i IR streams under nvblox_examples_bringup's
+    # /camera0 namespace. Override these for any other stereo source.
+    args.add_arg('s2m2_left_topic', '/camera0/infra1/image_rect_raw',
+                 description='Left rectified stereo image. D435i IR1 by default.', cli=True)
+    args.add_arg('s2m2_right_topic', '/camera0/infra2/image_rect_raw',
+                 description='Right rectified stereo image. D435i IR2 by default.', cli=True)
+    args.add_arg('s2m2_camera_info_topic', '/camera0/infra1/camera_info',
+                 description='CameraInfo for the left image. D435i IR1 by default.', cli=True)
     args.add_arg('s2m2_output_depth_topic', '/camera0/depth/image_rect_raw', cli=True)
     args.add_arg('s2m2_output_camera_info_topic', '/camera0/depth/camera_info', cli=True)
     args.add_arg('s2m2_width', 0,
@@ -133,11 +138,10 @@ def generate_launch_description() -> LaunchDescription:
             IfCondition(PythonExpression(['int("', args.num_cameras, '") > 4']))),
     )
 
-    # Don't run the RealSense driver when an external stereo source feeds S2M2.
+    # The RealSense driver still runs in the s2m2 path because we use its IR1/IR2
+    # streams as the stereo input to S2M2.
     run_rs_driver = UnlessCondition(
-        OrSubstitution(
-            OrSubstitution(lu.is_valid(args.rosbag), lu.is_false(args.run_realsense)),
-            lu.is_equal(args.depth_source, 's2m2')))
+        OrSubstitution(lu.is_valid(args.rosbag), lu.is_false(args.run_realsense)))
     # Realsense
     actions.append(
         lu.include(
