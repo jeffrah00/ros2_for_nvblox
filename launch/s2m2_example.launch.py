@@ -219,6 +219,9 @@ def generate_launch_description() -> LaunchDescription:
 
     # Nvblox. When depth_source=s2m2, remap the depth topics to the S2M2 output
     # topics so nvblox subscribes to S2M2's depth instead of the RealSense's.
+    # The same SetRemap also covers visualization.launch.py — that's why both
+    # nvblox and visualization are wrapped in the GroupActions below — so RViz
+    # picks the custom depth topic automatically without manual topic switching.
     def _nvblox_include():
         return lu.include(
             'nvblox_examples_bringup',
@@ -230,16 +233,27 @@ def generate_launch_description() -> LaunchDescription:
                 'num_cameras': args.num_cameras,
             })
 
+    def _visualization_include():
+        return lu.include(
+            'nvblox_examples_bringup',
+            'launch/visualization/visualization.launch.py',
+            launch_arguments={
+                'mode': args.mode,
+                'camera': camera_mode,
+                'use_foxglove_whitelist': args.use_foxglove_whitelist,
+            })
+
     actions.append(GroupAction(
         actions=[
             SetRemap(src='/camera0/depth/image_rect_raw', dst=args.s2m2_output_depth_topic),
             SetRemap(src='/camera0/depth/camera_info', dst=args.s2m2_output_camera_info_topic),
             _nvblox_include(),
+            _visualization_include(),
         ],
         condition=LaunchConfigurationEquals('depth_source', 's2m2')))
 
     actions.append(GroupAction(
-        actions=[_nvblox_include()],
+        actions=[_nvblox_include(), _visualization_include()],
         condition=LaunchConfigurationEquals('depth_source', 'realsense')))
 
     # TF transforms for multi-realsense
@@ -254,17 +268,6 @@ def generate_launch_description() -> LaunchDescription:
             bag_path=args.rosbag,
             additional_bag_play_args=args.rosbag_args,
             condition=IfCondition(lu.is_valid(args.rosbag))))
-
-    # Visualization
-    actions.append(
-        lu.include(
-            'nvblox_examples_bringup',
-            'launch/visualization/visualization.launch.py',
-            launch_arguments={
-                'mode': args.mode,
-                'camera': camera_mode,
-                'use_foxglove_whitelist': args.use_foxglove_whitelist,
-            }))
 
     # S2M2 stereo-depth node. Run as a plain Python script so this repo stays
     # package-free; ROS params are forwarded via --ros-args. Empty string params
