@@ -245,10 +245,8 @@ def generate_launch_description() -> LaunchDescription:
 
     actions.append(GroupAction(
         actions=[
-            SetRemap(src='/camera0/realsense_splitter_node/output/depth',
-                     dst=args.s2m2_output_depth_topic),
-            SetRemap(src='/camera0/realsense_splitter_node/output/depth_camera_info',
-                     dst=args.s2m2_output_camera_info_topic),
+            SetRemap(src='/camera0/depth/image_rect_raw', dst=args.s2m2_output_depth_topic),
+            SetRemap(src='/camera0/depth/camera_info', dst=args.s2m2_output_camera_info_topic),
             _nvblox_include(),
             _visualization_include(),
         ],
