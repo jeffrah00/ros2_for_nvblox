@@ -2,9 +2,20 @@
 
 Three ROS 2 launch files that drive [Isaac ROS nvblox](https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nvblox):
 
-- **`realsense_example.launch.py`** — depth comes from a RealSense camera's onboard stereo module (default Isaac ROS nvblox example).
-- **`s2m2_example.launch.py`** — depth comes from the [S2M2](https://github.com/junhong-3dv/s2m2) stereo-matching network running on a stereo image pair. Defaults are wired to a RealSense D435i's two IR cameras (`/camera0/infra1`, `/camera0/infra2`); the topic names are launch args so any other stereo source works too. Everything downstream (vSLAM, nvblox, visualization) is identical.
-- **`custom_depth_example.launch.py`** — model-agnostic version of the S2M2 example. Loads any stereo network from an **ONNX `.onnx`** file (via `onnxruntime-gpu`) or a pre-built **TensorRT `.engine`**. Use this when you have pretrained weights from any other repo: export them to ONNX once and you're done.
+- **`launch/realsense_example.launch.py`** — depth comes from a RealSense camera's onboard stereo module (default Isaac ROS nvblox example).
+- **`launch/s2m2_example.launch.py`** — depth comes from the [S2M2](https://github.com/junhong-3dv/s2m2) stereo-matching network running on a stereo image pair. Defaults are wired to a RealSense D435i's two IR cameras (`/camera0/infra1`, `/camera0/infra2`); the topic names are launch args so any other stereo source works too. Everything downstream (vSLAM, nvblox, visualization) is identical.
+- **`launch/custom_depth_example.launch.py`** — model-agnostic version of the S2M2 example. Loads any stereo network from an **ONNX `.onnx`** file (via `onnxruntime-gpu`) or a pre-built **TensorRT `.engine`**. Use this when you have pretrained weights from any other repo: export them to ONNX once and you're done.
+
+```
+ros2_depth_for_nvblox/
+├── launch/        # ros2 launch entry points
+│   ├── realsense_example.launch.py
+│   ├── s2m2_example.launch.py
+│   └── custom_depth_example.launch.py
+└── scripts/       # rclpy nodes the launch files spawn
+    ├── s2m2_depth_node.py
+    └── custom_depth_node.py
+```
 
 ## Prerequisites
 
@@ -41,16 +52,16 @@ Both backends require inference H,W to be divisible by 32. If you don't set `s2m
 
 ```bash
 # PyTorch (default S model, RealSense D435i IR pair):
-ros2 launch s2m2_example.launch.py \
+ros2 launch launch/s2m2_example.launch.py \
     s2m2_weights_path:=/abs/path/to/s2m2/weights/S
 
 # TensorRT engine (height/width must match what the engine was exported with):
-ros2 launch s2m2_example.launch.py \
+ros2 launch launch/s2m2_example.launch.py \
     s2m2_engine_path:=/abs/path/to/s2m2_S_384x640.engine \
     s2m2_height:=384 s2m2_width:=640
 
 # Custom stereo source (override topic names):
-ros2 launch s2m2_example.launch.py \
+ros2 launch launch/s2m2_example.launch.py \
     s2m2_weights_path:=/abs/path/to/weights/S \
     s2m2_left_topic:=/my_cam/left/image_rect \
     s2m2_right_topic:=/my_cam/right/image_rect \
@@ -58,11 +69,11 @@ ros2 launch s2m2_example.launch.py \
     s2m2_baseline_m:=0.12
 
 # Replay from a stereo rosbag:
-ros2 launch s2m2_example.launch.py \
+ros2 launch launch/s2m2_example.launch.py \
     rosbag:=/path/to/bag s2m2_weights_path:=/abs/path/to/weights/S
 
 # Fall back to the default RealSense onboard depth:
-ros2 launch s2m2_example.launch.py depth_source:=realsense
+ros2 launch launch/s2m2_example.launch.py depth_source:=realsense
 ```
 
 The S2M2 node subscribes (defaults are RealSense D435i IR; override via the args below for any other stereo source):
@@ -109,13 +120,13 @@ python s2m2/export_onnx.py \
     --output stereo_S_384x640.onnx
 
 # Run nvblox with the ONNX model:
-ros2 launch custom_depth_example.launch.py \
+ros2 launch launch/custom_depth_example.launch.py \
     custom_onnx_path:=/abs/path/to/stereo_S_384x640.onnx \
     custom_height:=384 custom_width:=640 \
     custom_baseline_m:=0.05
 
 # Or with a TensorRT engine (faster):
-ros2 launch custom_depth_example.launch.py \
+ros2 launch launch/custom_depth_example.launch.py \
     custom_engine_path:=/abs/path/to/stereo_S_384x640.engine \
     custom_height:=384 custom_width:=640
 ```
@@ -130,4 +141,4 @@ Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/dept
 - **Shape error from S2M2** — make `s2m2_width`/`s2m2_height` divisible by 32, or leave them as `0` and let the node auto-crop.
 - **TensorRT shape mismatch** — re-export the engine at the exact `s2m2_height`/`s2m2_width` you launch with.
 - **nvblox reports no depth** — confirm the launch file's `SetRemap` source (`/camera0/depth/image_rect_raw`) matches your nvblox version's expected depth topic. The S2M2 node publishes to `/s2m2/depth/...` and the remap routes nvblox to it; override `s2m2_output_depth_topic` / `s2m2_output_camera_info_topic` to publish under a different name.
-- **Sync drops** — loosen the `ApproximateTimeSynchronizer` slop in `s2m2_depth_node.py` or align timestamps in your bag.
+- **Sync drops** — loosen the `ApproximateTimeSynchronizer` slop in `scripts/s2m2_depth_node.py` (or `scripts/custom_depth_node.py`) or align timestamps in your bag.

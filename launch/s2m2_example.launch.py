@@ -269,7 +269,8 @@ def generate_launch_description() -> LaunchDescription:
     # S2M2 stereo-depth node. Run as a plain Python script so this repo stays
     # package-free; ROS params are forwarded via --ros-args. Empty string params
     # are skipped because `-p name:=` (no value) is rejected by rcl.
-    s2m2_script = os.path.join(os.path.dirname(__file__), 's2m2_depth_node.py')
+    s2m2_script = os.path.join(
+        os.path.dirname(__file__), '..', 'scripts', 's2m2_depth_node.py')
 
     def _build_s2m2_proc(context, *_):
         param_names = [

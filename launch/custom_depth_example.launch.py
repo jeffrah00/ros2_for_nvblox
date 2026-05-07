@@ -244,7 +244,8 @@ def generate_launch_description() -> LaunchDescription:
 
     # Custom stereo-depth node. Build the cmd at evaluation time and skip empty
     # params (rcl rejects `-p name:=` with no value).
-    custom_script = os.path.join(os.path.dirname(__file__), 'custom_depth_node.py')
+    custom_script = os.path.join(
+        os.path.dirname(__file__), '..', 'scripts', 'custom_depth_node.py')
 
     def _build_custom_proc(context, *_):
         param_names = [
