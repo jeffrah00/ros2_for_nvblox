@@ -22,7 +22,7 @@ ros2_depth_for_nvblox/
 - ROS 2 + Isaac ROS nvblox bringup: `nvblox_examples_bringup`, `isaac_ros_launch_utils`, `nvblox_ros_python_utils`.
 - CUDA-enabled GPU + PyTorch (matching the CUDA version on your machine).
 - Python deps: `cv_bridge`, `message_filters` (already pulled in by Isaac ROS), `opencv-python`, `numpy`.
-- For the TensorRT path: `tensorrt`, `pycuda`.
+- For the TensorRT path: `tensorrt` + `pycuda`. Both TRT 10.x (tensor-name API + `execute_async_v3`) and TRT ≤9.x (binding-index API + `execute_v2`) are supported — the node detects which is installed at startup.
 - For the generic `custom_depth_example.launch.py` ONNX path: `onnxruntime-gpu` (`pip install onnxruntime-gpu`).
 
 ## Install S2M2
