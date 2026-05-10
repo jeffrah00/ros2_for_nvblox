@@ -232,8 +232,8 @@ def generate_launch_description() -> LaunchDescription:
 
     actions.append(GroupAction(
         actions=[
-            SetRemap(src='/camera0/depth/image_rect_raw', dst=args.s2m2_output_depth_topic),
-            SetRemap(src='/camera0/depth/camera_info', dst=args.s2m2_output_camera_info_topic),
+            SetRemap(src='camera_0/depth/image', dst=args.s2m2_output_depth_topic),
+            SetRemap(src='camera_0/depth/camera_info', dst=args.s2m2_output_camera_info_topic),
             _nvblox_include(),
         ],
         condition=LaunchConfigurationEquals('depth_source', 's2m2')))
