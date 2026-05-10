@@ -142,4 +142,9 @@ Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/dept
 - **TensorRT shape mismatch** — re-export the engine at the exact `s2m2_height`/`s2m2_width` you launch with.
 - **nvblox reports no depth** — confirm the launch file's `SetRemap` source (`/camera0/depth/image_rect_raw`) matches your nvblox version's expected depth topic. The S2M2 node publishes to `/s2m2/depth/...` and the remap routes nvblox to it; override `s2m2_output_depth_topic` / `s2m2_output_camera_info_topic` to publish under a different name.
 - **Sync drops** — loosen the `ApproximateTimeSynchronizer` slop in `scripts/s2m2_depth_node.py` (or `scripts/custom_depth_node.py`) or align timestamps in your bag.
-- **Use a custom RViz config** — `nvblox_examples_bringup`'s `visualization.launch.py` accepts an `rviz_config` launch argument. The launch files in this repo don't forward it by default; to use one, add `'rviz_config': '/abs/path/to/your.rviz'` to the `launch_arguments` dict of the `visualization.launch.py` include in `launch/s2m2_example.launch.py` (or `launch/custom_depth_example.launch.py`), then `ros2 launch ...` as usual.
+- **Use a custom RViz config** — pass `rviz_config:=/abs/path/to/your.rviz` on the launch command. It propagates to the included `nvblox_examples_bringup` `visualization.launch.py`, e.g.:
+  ```bash
+  ros2 launch launch/s2m2_example.launch.py \
+      s2m2_engine_path:=/abs/path/to.engine s2m2_height:=384 s2m2_width:=640 \
+      rviz_config:=/abs/path/to/your.rviz
+  ```
