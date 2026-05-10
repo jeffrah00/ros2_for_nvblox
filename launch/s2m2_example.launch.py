@@ -81,12 +81,6 @@ def generate_launch_description() -> LaunchDescription:
         True,
         description='Disable visualization of bandwidth-heavy topics',
         cli=True)
-    args.add_arg(
-        'rviz_config', '',
-        description='Optional .rviz file. If set, forwarded to '
-                    'nvblox_examples_bringup visualization.launch.py as rviz_config:=. '
-                    'Leave empty to use the upstream default.',
-        cli=True)
 
     # ---- S2M2 custom-depth args ---------------------------------------------
     args.add_arg('depth_source', 's2m2', choices=['s2m2', 'realsense'],
@@ -238,8 +232,8 @@ def generate_launch_description() -> LaunchDescription:
 
     actions.append(GroupAction(
         actions=[
-            SetRemap(src='camera_0/depth/image', dst=args.s2m2_output_depth_topic),
-            SetRemap(src='camera_0/depth/camera_info', dst=args.s2m2_output_camera_info_topic),
+            SetRemap(src='/camera0/depth/image_rect_raw', dst=args.s2m2_output_depth_topic),
+            SetRemap(src='/camera0/depth/camera_info', dst=args.s2m2_output_camera_info_topic),
             _nvblox_include(),
         ],
         condition=LaunchConfigurationEquals('depth_source', 's2m2')))
@@ -261,22 +255,16 @@ def generate_launch_description() -> LaunchDescription:
             additional_bag_play_args=args.rosbag_args,
             condition=IfCondition(lu.is_valid(args.rosbag))))
 
-    # Visualization. rviz_config is forwarded only when non-empty so we don't
-    # override the upstream default with an empty path.
-    def _build_visualization(context, *_):
-        viz_args = {
-            'mode': args.mode,
-            'camera': camera_mode,
-            'use_foxglove_whitelist': args.use_foxglove_whitelist,
-        }
-        rviz_cfg = LaunchConfiguration('rviz_config').perform(context)
-        if rviz_cfg:
-            viz_args['rviz_config'] = rviz_cfg
-        return [lu.include(
+    # Visualization
+    actions.append(
+        lu.include(
             'nvblox_examples_bringup',
             'launch/visualization/visualization.launch.py',
-            launch_arguments=viz_args)]
-    actions.append(OpaqueFunction(function=_build_visualization))
+            launch_arguments={
+                'mode': args.mode,
+                'camera': camera_mode,
+                'use_foxglove_whitelist': args.use_foxglove_whitelist,
+            }))
 
     # S2M2 stereo-depth node. Run as a plain Python script so this repo stays
     # package-free; ROS params are forwarded via --ros-args. Empty string params

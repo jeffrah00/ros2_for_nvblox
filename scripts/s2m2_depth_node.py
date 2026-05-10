@@ -111,55 +111,30 @@ class S2M2DepthNode(Node):
         with open(engine_path, 'rb') as f, trt.Runtime(logger) as runtime:
             self.trt_engine = runtime.deserialize_cuda_engine(f.read())
         self.trt_context = self.trt_engine.create_execution_context()
-        self._trt = trt
-        self._cuda = cuda
 
-        # TRT >=10 dropped the binding-index API in favor of tensor names.
-        # Detect which API to use; both paths populate self.trt_io identically
-        # so _trt_infer can stay simple.
-        self._trt_use_tensor_api = hasattr(self.trt_engine, 'num_io_tensors')
         H, W = self.cfg_height, self.cfg_width
         self.trt_io = []
-
-        if self._trt_use_tensor_api:
-            # TRT 10+ path: tensor-name API.
-            for i in range(self.trt_engine.num_io_tensors):
-                name = self.trt_engine.get_tensor_name(i)
-                is_input = (self.trt_engine.get_tensor_mode(name)
-                            == trt.TensorIOMode.INPUT)
-                shape = tuple(self.trt_engine.get_tensor_shape(name))
-                if -1 in shape and is_input:
-                    self.trt_context.set_input_shape(name, (1, 3, H, W))
-                    shape = tuple(self.trt_context.get_tensor_shape(name))
-                dtype = trt.nptype(self.trt_engine.get_tensor_dtype(name))
-                host_buf = np.empty(shape, dtype=dtype)
-                dev_buf = cuda.mem_alloc(host_buf.nbytes)
-                self.trt_context.set_tensor_address(name, int(dev_buf))
-                self.trt_io.append({
-                    'name': name, 'is_input': is_input, 'shape': shape,
-                    'dtype': dtype, 'host': host_buf, 'dev': dev_buf,
-                })
-            self._trt_stream = cuda.Stream()
-            self.trt_bindings = None
-        else:
-            # TRT <=8/9 path: binding-index API.
-            self.trt_bindings = [None] * self.trt_engine.num_bindings
-            for i in range(self.trt_engine.num_bindings):
-                shape = tuple(self.trt_engine.get_binding_shape(i))
-                is_input = self.trt_engine.binding_is_input(i)
-                if -1 in shape and is_input:
+        self.trt_bindings = [None] * self.trt_engine.num_bindings
+        for i in range(self.trt_engine.num_bindings):
+            shape = tuple(self.trt_engine.get_binding_shape(i))
+            if -1 in shape:
+                # Dynamic shape: assume input is (1,3,H,W); set it.
+                if self.trt_engine.binding_is_input(i):
                     self.trt_context.set_binding_shape(i, (1, 3, H, W))
                     shape = (1, 3, H, W)
-                dtype = trt.nptype(self.trt_engine.get_binding_dtype(i))
-                host_buf = np.empty(shape, dtype=dtype)
-                dev_buf = cuda.mem_alloc(host_buf.nbytes)
-                self.trt_bindings[i] = int(dev_buf)
-                self.trt_io.append({
-                    'name': self.trt_engine.get_binding_name(i),
-                    'is_input': is_input, 'shape': shape, 'dtype': dtype,
-                    'host': host_buf, 'dev': dev_buf,
-                })
-            self._trt_stream = None
+            dtype = trt.nptype(self.trt_engine.get_binding_dtype(i))
+            host_buf = np.empty(shape, dtype=dtype)
+            dev_buf = cuda.mem_alloc(host_buf.nbytes)
+            self.trt_bindings[i] = int(dev_buf)
+            self.trt_io.append({
+                'name': self.trt_engine.get_binding_name(i),
+                'is_input': self.trt_engine.binding_is_input(i),
+                'shape': shape,
+                'dtype': dtype,
+                'host': host_buf,
+                'dev': dev_buf,
+            })
+        self._cuda = cuda
 
         # Sanity-check: any input must accept (1,3,H,W).
         for io in self.trt_io:
@@ -294,11 +269,7 @@ class S2M2DepthNode(Node):
 
         for io in in_buffers:
             self._cuda.memcpy_htod(io['dev'], io['host'])
-        if self._trt_use_tensor_api:
-            self.trt_context.execute_async_v3(self._trt_stream.handle)
-            self._trt_stream.synchronize()
-        else:
-            self.trt_context.execute_v2(self.trt_bindings)
+        self.trt_context.execute_v2(self.trt_bindings)
         for io in out_buffers:
             self._cuda.memcpy_dtoh(io['host'], io['dev'])
 

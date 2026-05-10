@@ -22,7 +22,7 @@ ros2_depth_for_nvblox/
 - ROS 2 + Isaac ROS nvblox bringup: `nvblox_examples_bringup`, `isaac_ros_launch_utils`, `nvblox_ros_python_utils`.
 - CUDA-enabled GPU + PyTorch (matching the CUDA version on your machine).
 - Python deps: `cv_bridge`, `message_filters` (already pulled in by Isaac ROS), `opencv-python`, `numpy`.
-- For the TensorRT path: `tensorrt` + `pycuda`. Both TRT 10.x (tensor-name API) and TRT ≤9.x (binding-index API) are supported — the node detects which is available and uses the matching path.
+- For the TensorRT path: `tensorrt`, `pycuda`.
 - For the generic `custom_depth_example.launch.py` ONNX path: `onnxruntime-gpu` (`pip install onnxruntime-gpu`).
 
 ## Install S2M2
@@ -107,7 +107,6 @@ For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.0
 | `s2m2_baseline_m` | `0.05` | stereo baseline in meters (left CameraInfo doesn't carry it) |
 | `s2m2_confidence_threshold` | `0.0` | mask depth where conf < threshold; `0` disables |
 | `s2m2_device` | `cuda` | `cuda` or `cpu` |
-| `rviz_config` | _empty_ | optional path to a `.rviz` file; forwarded to upstream visualization.launch.py |
 
 ## Generic example (`custom_depth_example.launch.py`)
 
