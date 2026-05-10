@@ -74,6 +74,11 @@ ros2 launch launch/s2m2_example.launch.py \
 
 # Fall back to the default RealSense onboard depth:
 ros2 launch launch/s2m2_example.launch.py depth_source:=realsense
+
+# Use a custom RViz config (forwarded to nvblox_examples_bringup's visualization.launch.py):
+ros2 launch launch/s2m2_example.launch.py \
+    s2m2_weights_path:=/abs/path/to/weights/S \
+    rviz_config:=/abs/path/to/your.rviz
 ```
 
 The S2M2 node subscribes (defaults are RealSense D435i IR; override via the args below for any other stereo source):
@@ -107,6 +112,7 @@ For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.0
 | `s2m2_baseline_m` | `0.05` | stereo baseline in meters (left CameraInfo doesn't carry it) |
 | `s2m2_confidence_threshold` | `0.0` | mask depth where conf < threshold; `0` disables |
 | `s2m2_device` | `cuda` | `cuda` or `cpu` |
+| `rviz_config` | _empty_ | path to a `.rviz` file; propagates to the included `nvblox_examples_bringup` `visualization.launch.py` |
 
 ## Generic example (`custom_depth_example.launch.py`)
 
@@ -142,9 +148,3 @@ Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/dept
 - **TensorRT shape mismatch** — re-export the engine at the exact `s2m2_height`/`s2m2_width` you launch with.
 - **nvblox reports no depth** — confirm the launch file's `SetRemap` source (`/camera0/depth/image_rect_raw`) matches your nvblox version's expected depth topic. The S2M2 node publishes to `/s2m2/depth/...` and the remap routes nvblox to it; override `s2m2_output_depth_topic` / `s2m2_output_camera_info_topic` to publish under a different name.
 - **Sync drops** — loosen the `ApproximateTimeSynchronizer` slop in `scripts/s2m2_depth_node.py` (or `scripts/custom_depth_node.py`) or align timestamps in your bag.
-- **Use a custom RViz config** — pass `rviz_config:=/abs/path/to/your.rviz` on the launch command. It propagates to the included `nvblox_examples_bringup` `visualization.launch.py`, e.g.:
-  ```bash
-  ros2 launch launch/s2m2_example.launch.py \
-      s2m2_engine_path:=/abs/path/to.engine s2m2_height:=384 s2m2_width:=640 \
-      rviz_config:=/abs/path/to/your.rviz
-  ```
