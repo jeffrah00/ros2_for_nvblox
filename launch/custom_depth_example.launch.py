@@ -237,18 +237,22 @@ def generate_launch_description() -> LaunchDescription:
             additional_bag_play_args=args.rosbag_args,
             condition=IfCondition(lu.is_valid(args.rosbag))))
 
-    # Visualization. rviz_config is forwarded directly; pass
-    # rviz_config:=/abs/path/to.rviz on the command line to use a custom config.
-    actions.append(
-        lu.include(
+    # Visualization. rviz_config is forwarded only when non-empty so we don't
+    # override the upstream default with an empty path.
+    def _build_visualization(context, *_):
+        viz_args = {
+            'mode': args.mode,
+            'camera': camera_mode,
+            'use_foxglove_whitelist': args.use_foxglove_whitelist,
+        }
+        rviz_cfg = LaunchConfiguration('rviz_config').perform(context)
+        if rviz_cfg:
+            viz_args['rviz_config'] = rviz_cfg
+        return [lu.include(
             'nvblox_examples_bringup',
             'launch/visualization/visualization.launch.py',
-            launch_arguments={
-                'mode': args.mode,
-                'camera': camera_mode,
-                'use_foxglove_whitelist': args.use_foxglove_whitelist,
-                'rviz_config': args.rviz_config,
-            }))
+            launch_arguments=viz_args)]
+    actions.append(OpaqueFunction(function=_build_visualization))
 
     # Custom stereo-depth node. Build the cmd at evaluation time and skip empty
     # params (rcl rejects `-p name:=` with no value).
