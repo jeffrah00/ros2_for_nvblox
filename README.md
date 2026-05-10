@@ -107,7 +107,7 @@ For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.0
 | `s2m2_baseline_m` | `0.05` | stereo baseline in meters (left CameraInfo doesn't carry it) |
 | `s2m2_confidence_threshold` | `0.0` | mask depth where conf < threshold; `0` disables |
 | `s2m2_device` | `cuda` | `cuda` or `cpu` |
-| `rviz_config` | _empty_ | optional path to a `.rviz` file; forwarded to upstream visualization.launch.py |
+| `rviz_config` | _empty_ | path to a `.rviz` file. Pass e.g. `rviz_config:=/abs/path/to/my.rviz` on the launch command to load it. Forwarded as-is to upstream `visualization.launch.py`. |
 
 ## Generic example (`custom_depth_example.launch.py`)
 
