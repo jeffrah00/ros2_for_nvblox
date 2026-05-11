@@ -109,6 +109,10 @@ def generate_launch_description() -> LaunchDescription:
     args.add_arg('s2m2_output_camera_info_topic', '/s2m2/depth/camera_info',
                  description='Where the S2M2 node publishes the matching CameraInfo.',
                  cli=True)
+    args.add_arg('s2m2_output_viz_topic', '/s2m2/depth/image_visualization',
+                 description='Colorized 8-bit BGR depth (turbo colormap) for RViz. '
+                             'Normalized to [min_depth_m, max_depth_m] when set, else to per-frame min/max.',
+                 cli=True)
     args.add_arg('s2m2_width', 0,
                  description='Inference width. 0 = crop to nearest /32. Must be divisible by 32 if set.',
                  cli=True)
@@ -120,6 +124,14 @@ def generate_launch_description() -> LaunchDescription:
                  cli=True)
     args.add_arg('s2m2_confidence_threshold', 0.0,
                  description='Zero out depth where conf < threshold. 0 disables masking.',
+                 cli=True)
+    args.add_arg('s2m2_min_depth_m', 0.0,
+                 description='Lower bound (meters). Depth below this is set to 0. '
+                             'Disabled if max_depth_m <= min_depth_m.',
+                 cli=True)
+    args.add_arg('s2m2_max_depth_m', 0.0,
+                 description='Upper bound (meters). Depth above this is set to 0. '
+                             'Disabled if max_depth_m <= min_depth_m.',
                  cli=True)
     args.add_arg('s2m2_device', 'cuda', choices=['cuda', 'cpu'], cli=True)
 
@@ -276,8 +288,9 @@ def generate_launch_description() -> LaunchDescription:
         param_names = [
             'model_type', 'num_refine', 'weights_path', 'engine_path',
             'left_topic', 'right_topic', 'camera_info_topic',
-            'output_depth_topic', 'output_camera_info_topic',
-            'width', 'height', 'baseline_m', 'confidence_threshold', 'device',
+            'output_depth_topic', 'output_camera_info_topic', 'output_viz_topic',
+            'width', 'height', 'baseline_m', 'confidence_threshold',
+            'min_depth_m', 'max_depth_m', 'device',
         ]
         cmd = ['python3', s2m2_script, '--ros-args']
         for name in param_names:

@@ -94,6 +94,10 @@ def generate_launch_description() -> LaunchDescription:
     args.add_arg('custom_output_camera_info_topic', '/custom_depth/depth/camera_info',
                  description='Where the custom node publishes the matching CameraInfo.',
                  cli=True)
+    args.add_arg('custom_output_viz_topic', '/custom_depth/depth/image_visualization',
+                 description='Colorized 8-bit BGR depth (turbo colormap) for RViz. '
+                             'Normalized to [min_depth_m, max_depth_m] when set, else to per-frame min/max.',
+                 cli=True)
     args.add_arg('custom_width', 0,
                  description='Inference width. 0 = crop to nearest /32. Must be divisible by 32 if set.',
                  cli=True)
@@ -105,6 +109,14 @@ def generate_launch_description() -> LaunchDescription:
                  cli=True)
     args.add_arg('custom_confidence_threshold', 0.0,
                  description='Zero out depth where conf < threshold. 0 disables masking.',
+                 cli=True)
+    args.add_arg('custom_min_depth_m', 0.0,
+                 description='Lower bound (meters). Depth below this is set to 0. '
+                             'Disabled if max_depth_m <= min_depth_m.',
+                 cli=True)
+    args.add_arg('custom_max_depth_m', 0.0,
+                 description='Upper bound (meters). Depth above this is set to 0. '
+                             'Disabled if max_depth_m <= min_depth_m.',
                  cli=True)
     args.add_arg('custom_input_scale', 1.0 / 255.0,
                  description='Multiplier applied to uint8 input before inference. '
@@ -251,9 +263,10 @@ def generate_launch_description() -> LaunchDescription:
         param_names = [
             'onnx_path', 'engine_path',
             'left_topic', 'right_topic', 'camera_info_topic',
-            'output_depth_topic', 'output_camera_info_topic',
+            'output_depth_topic', 'output_camera_info_topic', 'output_viz_topic',
             'width', 'height',
             'baseline_m', 'confidence_threshold', 'input_scale',
+            'min_depth_m', 'max_depth_m',
             'device',
         ]
         cmd = ['python3', custom_script, '--ros-args']

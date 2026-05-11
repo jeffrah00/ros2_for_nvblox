@@ -53,10 +53,13 @@ class S2M2DepthNode(Node):
         self.declare_parameter('camera_info_topic', '/stereo/left/camera_info')
         self.declare_parameter('output_depth_topic', '/s2m2/depth/image_rect_raw')
         self.declare_parameter('output_camera_info_topic', '/s2m2/depth/camera_info')
+        self.declare_parameter('output_viz_topic', '/s2m2/depth/image_visualization')
         self.declare_parameter('width', 0)
         self.declare_parameter('height', 0)
         self.declare_parameter('baseline_m', 0.05)
         self.declare_parameter('confidence_threshold', 0.0)
+        self.declare_parameter('min_depth_m', 0.0)
+        self.declare_parameter('max_depth_m', 0.0)
         self.declare_parameter('device', 'cuda')
 
         self.cfg_width = int(self.get_parameter('width').value)
@@ -69,6 +72,8 @@ class S2M2DepthNode(Node):
             raise SystemExit(1)
         self.baseline_m = float(self.get_parameter('baseline_m').value)
         self.conf_thr = float(self.get_parameter('confidence_threshold').value)
+        self.min_depth_m = float(self.get_parameter('min_depth_m').value)
+        self.max_depth_m = float(self.get_parameter('max_depth_m').value)
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -175,6 +180,7 @@ class S2M2DepthNode(Node):
         info_topic = self.get_parameter('camera_info_topic').value
         out_depth = self.get_parameter('output_depth_topic').value
         out_info = self.get_parameter('output_camera_info_topic').value
+        out_viz = self.get_parameter('output_viz_topic').value
 
         left_sub = message_filters.Subscriber(self, Image, left_topic)
         right_sub = message_filters.Subscriber(self, Image, right_topic)
@@ -185,9 +191,10 @@ class S2M2DepthNode(Node):
 
         self.pub_depth = self.create_publisher(Image, out_depth, 5)
         self.pub_info = self.create_publisher(CameraInfo, out_info, 5)
+        self.pub_viz = self.create_publisher(Image, out_viz, 5)
         self.get_logger().info(
             f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
-            f'publishing: {out_depth}, {out_info}')
+            f'publishing: {out_depth}, {out_info}, {out_viz}')
 
     # --------------------------------------------------------------- callback
     def on_stereo(self, left_msg: Image, right_msg: Image, info_msg: CameraInfo):
@@ -249,6 +256,11 @@ class S2M2DepthNode(Node):
             mask = mask | (conf < self.conf_thr)
         depth[mask] = 0.0
 
+        # Clip to user-set distance range. Anything outside becomes invalid (0),
+        # which is the convention nvblox already expects.
+        if self.max_depth_m > self.min_depth_m:
+            depth[(depth < self.min_depth_m) | (depth > self.max_depth_m)] = 0.0
+
         # Restore to original dimensions so depth aligns with the unmodified CameraInfo.
         if mode == 'resize':
             depth_full = cv2.resize(depth, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
@@ -259,6 +271,8 @@ class S2M2DepthNode(Node):
         depth_msg = self.bridge.cv2_to_imgmsg(depth_full, encoding='32FC1')
         depth_msg.header = left_msg.header
         self.pub_depth.publish(depth_msg)
+
+        self._publish_viz(depth_full, left_msg.header)
 
         info_out = CameraInfo()
         info_out.header = left_msg.header
@@ -273,6 +287,27 @@ class S2M2DepthNode(Node):
         info_out.binning_y = info_msg.binning_y
         info_out.roi = info_msg.roi
         self.pub_info.publish(info_out)
+
+    # ----------------------------------------------------------------- viz fn
+    def _publish_viz(self, depth_full: np.ndarray, header):
+        # Normalize to user-set [min, max] when configured, else to the frame's
+        # own valid range so the viz never goes all-black even when filtering
+        # is disabled. Invalid pixels (0) stay black.
+        if self.max_depth_m > self.min_depth_m:
+            lo, hi = self.min_depth_m, self.max_depth_m
+        else:
+            valid = depth_full[depth_full > 0]
+            if valid.size:
+                lo, hi = float(valid.min()), float(valid.max())
+            else:
+                lo, hi = 0.0, 1.0
+        norm = np.clip((depth_full - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        viz_u8 = (norm * 255).astype(np.uint8)
+        viz_u8[depth_full == 0] = 0
+        viz_bgr = cv2.applyColorMap(viz_u8, cv2.COLORMAP_TURBO)
+        viz_msg = self.bridge.cv2_to_imgmsg(viz_bgr, encoding='bgr8')
+        viz_msg.header = header
+        self.pub_viz.publish(viz_msg)
 
     # ----------------------------------------------------------------- trt fn
     def _trt_infer(self, left_t: torch.Tensor, right_t: torch.Tensor):

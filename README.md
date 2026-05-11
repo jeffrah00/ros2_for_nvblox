@@ -90,6 +90,7 @@ The S2M2 node subscribes (defaults are RealSense D435i IR; override via the args
 | in        | `/camera0/infra1/camera_info`                     | left CameraInfo |
 | out       | `/s2m2/depth/image_rect_raw` (`32FC1`, meters)    | distinguishable from RealSense splitter's `/camera0/depth/...`; nvblox is remapped to it |
 | out       | `/s2m2/depth/camera_info`                         |       |
+| out       | `/s2m2/depth/image_visualization` (`bgr8`)        | colorized depth for RViz; normalized to `[s2m2_min_depth_m, s2m2_max_depth_m]` when set, else to the frame's own min/max |
 
 For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.05`, which is the default). Verify against your unit's calibration.
 
@@ -107,10 +108,13 @@ For the D435i specifically, the stereo baseline is ~50 mm (`s2m2_baseline_m:=0.0
 | `s2m2_camera_info_topic` | `/camera0/infra1/camera_info` | left CameraInfo |
 | `s2m2_output_depth_topic` | `/s2m2/depth/image_rect_raw` | nvblox is remapped to this |
 | `s2m2_output_camera_info_topic` | `/s2m2/depth/camera_info` | |
+| `s2m2_output_viz_topic` | `/s2m2/depth/image_visualization` | colorized 8-bit depth (turbo colormap) for RViz |
 | `s2m2_width` | `0` | inference width; `0` = crop to nearest /32. Must be divisible by 32. |
 | `s2m2_height` | `0` | inference height; same rule. |
 | `s2m2_baseline_m` | `0.05` | stereo baseline in meters (left CameraInfo doesn't carry it) |
 | `s2m2_confidence_threshold` | `0.0` | mask depth where conf < threshold; `0` disables |
+| `s2m2_min_depth_m` | `0.0` | clip published depth below this (meters); also sets viz lower bound. Disabled if `max <= min`. |
+| `s2m2_max_depth_m` | `0.0` | clip published depth above this (meters); also sets viz upper bound. Disabled if `max <= min`. |
 | `s2m2_device` | `cuda` | `cuda` or `cpu` |
 | `rviz_config` | _empty_ | path to a `.rviz` file; propagates to the included `nvblox_examples_bringup` `visualization.launch.py` |
 
@@ -139,11 +143,12 @@ ros2 launch launch/custom_depth_example.launch.py \
 
 The generic node assumes the model takes **two inputs** `(1, 3, H, W)` (left, right; float32 in `[0,1]` by default — set `custom_input_scale:=1.0` for raw uint8) and returns **1, 2, or 3 outputs** in order: disparity `(1, H, W)`, optional occlusion mask, optional confidence map. If your model has different conventions, re-export to match.
 
-Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/depth/camera_info`; nvblox is remapped to those via the launch file's `SetRemap`. All other launch args mirror the S2M2 example with a `custom_` prefix instead of `s2m2_`.
+Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/depth/camera_info`; nvblox is remapped to those via the launch file's `SetRemap`. The node also publishes a colorized 8-bit visualization on `/custom_depth/depth/image_visualization` (turbo colormap, normalized to `[custom_min_depth_m, custom_max_depth_m]` when set, else to the frame's own min/max). All other launch args mirror the S2M2 example with a `custom_` prefix instead of `s2m2_`, including `custom_min_depth_m` / `custom_max_depth_m` / `custom_output_viz_topic`.
 
 ## Troubleshooting
 
-- **All-zero or wildly wrong depth** — set `s2m2_baseline_m` to your actual stereo baseline in meters. The left CameraInfo's projection matrix typically does not encode it.
+- **Depth image is mostly black in RViz** — RViz's default `Image` display for `32FC1` maps values via `[0, 1]`, so depths > 1 m saturate and invalid pixels (0) render black. First, subscribe to `/s2m2/depth/image_visualization` (or `/custom_depth/depth/image_visualization`) — that's an 8-bit colorized image that renders correctly with no RViz tuning. If that looks reasonable, the original "black" was a viz issue. If it still looks wrong, set an explicit range to constrain what the node publishes and how the viz is normalized, e.g. `s2m2_min_depth_m:=0.3 s2m2_max_depth_m:=5.0`, and iterate.
+- **All-zero or wildly wrong depth** — set `s2m2_baseline_m` to your actual stereo baseline in meters. The left CameraInfo's projection matrix typically does not encode it. If the network is producing far-out depth from tiny disparities, set `s2m2_max_depth_m` to clip those to invalid.
 - **Shape error from S2M2** — make `s2m2_width`/`s2m2_height` divisible by 32, or leave them as `0` and let the node auto-crop.
 - **TensorRT shape mismatch** — re-export the engine at the exact `s2m2_height`/`s2m2_width` you launch with.
 - **nvblox reports no depth** — confirm the launch file's `SetRemap` source (`/camera0/depth/image_rect_raw`) matches your nvblox version's expected depth topic. The S2M2 node publishes to `/s2m2/depth/...` and the remap routes nvblox to it; override `s2m2_output_depth_topic` / `s2m2_output_camera_info_topic` to publish under a different name.
