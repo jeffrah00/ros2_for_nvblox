@@ -244,7 +244,9 @@ class S2M2DepthNode(Node):
         depth[valid] = (fx_used * self.baseline_m) / disp[valid]
 
         # Mask occluded / low-confidence pixels.
-        mask = (occ > 0.5)
+        # S2M2 model_utils semantics: occ == 0 means occluded; conf == 1 means
+        # disparity error < 4 px (else 0).
+        mask = (occ < 0.5)
         if self.conf_thr > 0.0:
             mask = mask | (conf < self.conf_thr)
         depth[mask] = 0.0
