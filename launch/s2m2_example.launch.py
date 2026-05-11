@@ -118,8 +118,12 @@ def generate_launch_description() -> LaunchDescription:
     args.add_arg('s2m2_baseline_m', 0.05,
                  description='Stereo baseline in meters (left CameraInfo does not carry it).',
                  cli=True)
-    args.add_arg('s2m2_confidence_threshold', 0.0,
-                 description='Zero out depth where conf < threshold. 0 disables masking.',
+    args.add_arg('s2m2_mask_occluded', 'True',
+                 description='Zero out depth where the S2M2 occlusion map is 0 (occluded).',
+                 cli=True)
+    args.add_arg('s2m2_mask_low_confidence', 'True',
+                 description='Zero out depth where the S2M2 confidence map is 0 '
+                             '(disparity error >= 4 px).',
                  cli=True)
     args.add_arg('s2m2_device', 'cuda', choices=['cuda', 'cpu'], cli=True)
 
@@ -277,7 +281,8 @@ def generate_launch_description() -> LaunchDescription:
             'model_type', 'num_refine', 'weights_path', 'engine_path',
             'left_topic', 'right_topic', 'camera_info_topic',
             'output_depth_topic', 'output_camera_info_topic',
-            'width', 'height', 'baseline_m', 'confidence_threshold', 'device',
+            'width', 'height', 'baseline_m', 'mask_occluded',
+            'mask_low_confidence', 'device',
         ]
         cmd = ['python3', s2m2_script, '--ros-args']
         for name in param_names:

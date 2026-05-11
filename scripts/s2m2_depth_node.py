@@ -56,7 +56,8 @@ class S2M2DepthNode(Node):
         self.declare_parameter('width', 0)
         self.declare_parameter('height', 0)
         self.declare_parameter('baseline_m', 0.05)
-        self.declare_parameter('confidence_threshold', 0.0)
+        self.declare_parameter('mask_occluded', True)
+        self.declare_parameter('mask_low_confidence', True)
         self.declare_parameter('device', 'cuda')
 
         self.cfg_width = int(self.get_parameter('width').value)
@@ -68,7 +69,8 @@ class S2M2DepthNode(Node):
             self.get_logger().fatal(f'height={self.cfg_height} must be divisible by 32')
             raise SystemExit(1)
         self.baseline_m = float(self.get_parameter('baseline_m').value)
-        self.conf_thr = float(self.get_parameter('confidence_threshold').value)
+        self.mask_occluded = bool(self.get_parameter('mask_occluded').value)
+        self.mask_low_conf = bool(self.get_parameter('mask_low_confidence').value)
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -244,9 +246,13 @@ class S2M2DepthNode(Node):
         depth[valid] = (fx_used * self.baseline_m) / disp[valid]
 
         # Mask occluded / low-confidence pixels.
-        mask = (occ > 0.5)
-        if self.conf_thr > 0.0:
-            mask = mask | (conf < self.conf_thr)
+        # S2M2 model_utils semantics: occ == 0 means occluded; conf is binary,
+        # 1 when disparity error < 4 px, else 0.
+        mask = np.zeros_like(disp, dtype=bool)
+        if self.mask_occluded:
+            mask |= (occ < 0.5)
+        if self.mask_low_conf:
+            mask |= (conf < 0.5)
         depth[mask] = 0.0
 
         # Restore to original dimensions so depth aligns with the unmodified CameraInfo.
