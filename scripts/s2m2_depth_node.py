@@ -90,6 +90,10 @@ class S2M2DepthNode(Node):
         self._last_infer_timing = {}    # sub-stage ms from the last inference call
         self._incoming_count = 0        # left-image msgs received since last FPS log
         self._outgoing_count = 0        # depth msgs delivered back to us since last log
+        self._depth_buf = None          # reused (H,W) float32 depth-at-inference-res
+        self._depth_full_buf = None     # reused (h_orig,w_orig) float32 output (crop mode)
+        self._depth_msg = None          # reused Image msg for the depth output
+        self._info_out = None           # cached CameraInfo (intrinsics are static)
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -311,47 +315,65 @@ class S2M2DepthNode(Node):
             disp, occ, conf = self._trt_infer(left_in, right_in)
         t_infer = time.perf_counter()
 
-        # Disparity -> depth at the inference resolution.
-        fx_used = float(info_msg.k[0]) * sx
-        depth = np.zeros_like(disp, dtype=np.float32)
-        valid = disp > 1e-3
-        depth[valid] = (fx_used * self.baseline_m) / disp[valid]
-
-        # Mask occluded / low-confidence pixels.
+        # Disparity -> depth at the inference resolution. One pass: build the
+        # valid mask (incl. occ/conf) once, then divide into a pre-zeroed buffer.
+        # Same final result as the previous gather/scatter divide + |= masking.
         # S2M2 model_utils semantics: occ == 0 means occluded; conf is binary,
         # 1 when disparity error < 4 px, else 0.
-        mask = np.zeros_like(disp, dtype=bool)
+        fx_used = float(info_msg.k[0]) * sx
+        valid = disp > 1e-3
         if self.mask_occluded:
-            mask |= (occ < 0.5)
+            valid &= (occ >= 0.5)
         if self.mask_low_conf:
-            mask |= (conf < 0.5)
-        depth[mask] = 0.0
+            valid &= (conf >= 0.5)
+        if self._depth_buf is None or self._depth_buf.shape != disp.shape:
+            self._depth_buf = np.zeros(disp.shape, dtype=np.float32)
+        depth = self._depth_buf
+        depth.fill(0.0)
+        np.divide(fx_used * self.baseline_m, disp, out=depth, where=valid)
 
         # Restore to original dimensions so depth aligns with the unmodified CameraInfo.
         if mode == 'resize':
             depth_full = cv2.resize(depth, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
         else:
-            depth_full = np.zeros((h_orig, w_orig), dtype=np.float32)
+            if self._depth_full_buf is None or self._depth_full_buf.shape != (h_orig, w_orig):
+                self._depth_full_buf = np.zeros((h_orig, w_orig), dtype=np.float32)
+            depth_full = self._depth_full_buf
             depth_full[oy:oy + H, ox:ox + W] = depth
         t_post = time.perf_counter()
 
-        depth_msg = self.bridge.cv2_to_imgmsg(depth_full, encoding='32FC1')
+        # Build the depth Image message by hand (skips cv_bridge's per-call
+        # encoding lookups / wrapper). Same bytes on the wire: cv2_to_imgmsg also
+        # just does arr.tobytes(). depth_full is C-contiguous in both modes.
+        if self._depth_msg is None:
+            self._depth_msg = Image()
+            self._depth_msg.encoding = '32FC1'
+            self._depth_msg.is_bigendian = 0
+        depth_msg = self._depth_msg
+        depth_msg.height = depth_full.shape[0]
+        depth_msg.width = depth_full.shape[1]
+        depth_msg.step = depth_full.shape[1] * 4
         depth_msg.header = left_msg.header
+        depth_msg.data = depth_full.tobytes()
         self.pub_depth.publish(depth_msg)
 
-        info_out = CameraInfo()
-        info_out.header = left_msg.header
-        info_out.height = info_msg.height
-        info_out.width = info_msg.width
-        info_out.distortion_model = info_msg.distortion_model
-        info_out.d = list(info_msg.d)
-        info_out.k = list(info_msg.k)
-        info_out.r = list(info_msg.r)
-        info_out.p = list(info_msg.p)
-        info_out.binning_x = info_msg.binning_x
-        info_out.binning_y = info_msg.binning_y
-        info_out.roi = info_msg.roi
-        self.pub_info.publish(info_out)
+        # CameraInfo intrinsics are static per camera: cache and reuse, refreshing
+        # only if k changes; each frame just stamp the header.
+        if self._info_out is None or list(self._info_out.k) != list(info_msg.k):
+            info_out = CameraInfo()
+            info_out.height = info_msg.height
+            info_out.width = info_msg.width
+            info_out.distortion_model = info_msg.distortion_model
+            info_out.d = list(info_msg.d)
+            info_out.k = list(info_msg.k)
+            info_out.r = list(info_msg.r)
+            info_out.p = list(info_msg.p)
+            info_out.binning_x = info_msg.binning_x
+            info_out.binning_y = info_msg.binning_y
+            info_out.roi = info_msg.roi
+            self._info_out = info_out
+        self._info_out.header = left_msg.header
+        self.pub_info.publish(self._info_out)
         t_pub = time.perf_counter()
 
         if not self._logged_first_frame:
@@ -391,7 +413,7 @@ class S2M2DepthNode(Node):
         if elapsed >= self._fps_log_period_s:
             count = self._fps_frame_count
             breakdown = ' | '.join(
-                f'{name} {self._fps_stage_acc[name] / count:.1f}/{self._fps_stage_max[name]:.0f}'
+                f'{name} {self._fps_stage_acc[name] / count:.1f}/{self._fps_stage_max[name]:.1f}'
                 for name in stage_ms)
             self.get_logger().info(
                 f'FPS: {count / elapsed:.1f} (in {self._incoming_count / elapsed:.1f} Hz, '
