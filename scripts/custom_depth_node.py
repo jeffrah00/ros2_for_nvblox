@@ -387,8 +387,7 @@ class CustomStereoDepthNode(Node):
         self._fps_frame_count += 1
         for name, ms in stage_ms.items():
             self._fps_stage_acc[name] = self._fps_stage_acc.get(name, 0.0) + ms
-            if ms > self._fps_stage_max.get(name, 0.0):
-                self._fps_stage_max[name] = ms
+            self._fps_stage_max[name] = max(self._fps_stage_max.get(name, 0.0), ms)
         elapsed = time.perf_counter() - self._fps_window_start
         if elapsed >= self._fps_log_period_s:
             count = self._fps_frame_count
