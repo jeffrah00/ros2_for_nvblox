@@ -84,7 +84,8 @@ class CustomStereoDepthNode(Node):
         self._fps_log_period_s = float(self.get_parameter('fps_log_period').value)
         self._fps_window_start = time.perf_counter()
         self._fps_frame_count = 0
-        self._fps_infer_time_acc = 0.0
+        self._fps_stage_acc = {}  # stage name -> accumulated ms within the window
+        self._logged_first_frame = False
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -216,6 +217,7 @@ class CustomStereoDepthNode(Node):
 
     # --------------------------------------------------------------- callback
     def on_stereo(self, left_msg: Image, right_msg: Image, info_msg: CameraInfo):
+        t_start = time.perf_counter()
         left = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding='passthrough')
         right = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='passthrough')
         left = _to_3channel(left)
@@ -223,6 +225,7 @@ class CustomStereoDepthNode(Node):
         if left.dtype != np.uint8:
             left = left.astype(np.uint8)
             right = right.astype(np.uint8)
+        t_decode = time.perf_counter()
 
         h_orig, w_orig = left.shape[:2]
         if self.cfg_width and self.cfg_height:
@@ -249,14 +252,14 @@ class CustomStereoDepthNode(Node):
         # NCHW float32 with input_scale (default 1/255 -> [0,1]).
         left_np = (left_in.transpose(2, 0, 1)[None].astype(np.float32) * self.input_scale)
         right_np = (right_in.transpose(2, 0, 1)[None].astype(np.float32) * self.input_scale)
+        t_pre = time.perf_counter()
 
         # Inference.
-        t0 = time.perf_counter()
         if self.backend == 'onnx':
             disp, occ, conf = self._onnx_infer(left_np, right_np)
         else:
             disp, occ, conf = self._trt_infer(left_np, right_np)
-        infer_ms = (time.perf_counter() - t0) * 1e3
+        t_infer = time.perf_counter()
 
         # Disparity -> depth at the inference resolution.
         fx_used = float(info_msg.k[0]) * sx
@@ -280,6 +283,7 @@ class CustomStereoDepthNode(Node):
         else:
             depth_full = np.zeros((h_orig, w_orig), dtype=np.float32)
             depth_full[oy:oy + H, ox:ox + W] = depth
+        t_post = time.perf_counter()
 
         depth_msg = self.bridge.cv2_to_imgmsg(depth_full, encoding='32FC1')
         depth_msg.header = left_msg.header
@@ -298,24 +302,40 @@ class CustomStereoDepthNode(Node):
         info_out.binning_y = info_msg.binning_y
         info_out.roi = info_msg.roi
         self.pub_info.publish(info_out)
+        t_pub = time.perf_counter()
 
-        self._update_fps(infer_ms)
+        if not self._logged_first_frame:
+            self._logged_first_frame = True
+            self.get_logger().info(
+                f'first frame: input {w_orig}x{h_orig} -> inference {W}x{H} ({mode}); '
+                f'backend={self.backend}')
+
+        self._update_fps({
+            'decode': (t_decode - t_start) * 1e3,
+            'pre': (t_pre - t_decode) * 1e3,
+            'infer': (t_infer - t_pre) * 1e3,
+            'post': (t_post - t_infer) * 1e3,
+            'pub': (t_pub - t_post) * 1e3,
+        })
 
     # ----------------------------------------------------------------- fps log
-    def _update_fps(self, infer_ms: float):
+    def _update_fps(self, stage_ms: dict):
         if self._fps_log_period_s <= 0.0:
             return
         self._fps_frame_count += 1
-        self._fps_infer_time_acc += infer_ms
+        for name, ms in stage_ms.items():
+            self._fps_stage_acc[name] = self._fps_stage_acc.get(name, 0.0) + ms
         elapsed = time.perf_counter() - self._fps_window_start
         if elapsed >= self._fps_log_period_s:
             count = self._fps_frame_count
+            breakdown = ' | '.join(
+                f'{name} {self._fps_stage_acc[name] / count:.1f}' for name in stage_ms)
             self.get_logger().info(
                 f'FPS: {count / elapsed:.1f} ({count} frames in {elapsed:.1f}s) | '
-                f'avg inference: {self._fps_infer_time_acc / count:.1f} ms')
+                f'{breakdown} ms (avg)')
             self._fps_window_start = time.perf_counter()
             self._fps_frame_count = 0
-            self._fps_infer_time_acc = 0.0
+            self._fps_stage_acc = {}
 
     # ---------------------------------------------------------------- onnx fn
     def _onnx_infer(self, left_np: np.ndarray, right_np: np.ndarray):
