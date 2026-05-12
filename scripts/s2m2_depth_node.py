@@ -79,6 +79,8 @@ class S2M2DepthNode(Node):
         self._fps_stage_acc = {}  # stage name -> accumulated ms within the window
         self._logged_first_frame = False
         self._prev_callback_end = None  # perf_counter at end of previous on_stereo
+        self._last_infer_timing = {}    # sub-stage ms from the last inference call
+        self._incoming_count = 0        # left-image msgs received since last FPS log
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -193,11 +195,20 @@ class S2M2DepthNode(Node):
             [left_sub, right_sub, info_sub], queue_size=10, slop=0.05)
         self.sync.registerCallback(self.on_stereo)
 
+        # Lightweight extra subscription on the left image purely to measure the
+        # rate this process actually receives, independent of `ros2 topic hz`
+        # (which is a separate subscriber). Same (default) QoS as message_filters.
+        self._incoming_sub = self.create_subscription(
+            Image, left_topic, self._incoming_cb, 10)
+
         self.pub_depth = self.create_publisher(Image, out_depth, 5)
         self.pub_info = self.create_publisher(CameraInfo, out_info, 5)
         self.get_logger().info(
             f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
             f'publishing: {out_depth}, {out_info}')
+
+    def _incoming_cb(self, _msg: Image):
+        self._incoming_count += 1
 
     # --------------------------------------------------------------- callback
     def on_stereo(self, left_msg: Image, right_msg: Image, info_msg: CameraInfo):
@@ -237,17 +248,24 @@ class S2M2DepthNode(Node):
 
         t_pre = time.perf_counter()
 
-        # Inference.
+        # Inference. Each branch fills self._last_infer_timing with sub-stage ms.
         if self.backend == 'torch':
             from s2m2.core.utils.model_utils import run_stereo_matching
+            ta = time.perf_counter()
             left_t = torch.from_numpy(left_in).permute(2, 0, 1).unsqueeze(0).to(self.device)
             right_t = torch.from_numpy(right_in).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            tb = time.perf_counter()
             with torch.inference_mode():
                 disp_t, occ_t, conf_t, _, _ = run_stereo_matching(
                     self.model, left_t, right_t, self.device, N_repeat=1)
+            tc = time.perf_counter()
             disp = disp_t.squeeze().detach().cpu().numpy().astype(np.float32)
             occ = occ_t.squeeze().detach().cpu().numpy()
             conf = conf_t.squeeze().detach().cpu().numpy()
+            td = time.perf_counter()
+            self._last_infer_timing = {
+                'up': (tb - ta) * 1e3, 'exec': (tc - tb) * 1e3, 'down': (td - tc) * 1e3,
+            }
         else:
             # TRT path takes numpy directly: no torch CUDA tensor (and no second
             # CUDA context) is created in this process.
@@ -306,14 +324,16 @@ class S2M2DepthNode(Node):
         idle_ms = ((t_start - self._prev_callback_end) * 1e3
                    if self._prev_callback_end is not None else 0.0)
         self._prev_callback_end = t_pub
-        self._update_fps({
+        stages = {
             'idle': idle_ms,
             'decode': (t_decode - t_start) * 1e3,
             'pre': (t_pre - t_decode) * 1e3,
             'infer': (t_infer - t_pre) * 1e3,
-            'post': (t_post - t_infer) * 1e3,
-            'pub': (t_pub - t_post) * 1e3,
-        })
+        }
+        stages.update(self._last_infer_timing)
+        stages['post'] = (t_post - t_infer) * 1e3
+        stages['pub'] = (t_pub - t_post) * 1e3
+        self._update_fps(stages)
 
     # ----------------------------------------------------------------- fps log
     def _update_fps(self, stage_ms: dict):
@@ -328,11 +348,12 @@ class S2M2DepthNode(Node):
             breakdown = ' | '.join(
                 f'{name} {self._fps_stage_acc[name] / count:.1f}' for name in stage_ms)
             self.get_logger().info(
-                f'FPS: {count / elapsed:.1f} ({count} frames in {elapsed:.1f}s) | '
-                f'{breakdown} ms (avg)')
+                f'FPS: {count / elapsed:.1f} (in {self._incoming_count / elapsed:.1f} Hz, '
+                f'{count} frames in {elapsed:.1f}s) | {breakdown} ms (avg)')
             self._fps_window_start = time.perf_counter()
             self._fps_frame_count = 0
             self._fps_stage_acc = {}
+            self._incoming_count = 0
 
     # ----------------------------------------------------------------- trt fn
     def _trt_infer(self, left_in: np.ndarray, right_in: np.ndarray):
@@ -341,28 +362,41 @@ class S2M2DepthNode(Node):
         # a pre-scaled input; this passes uint8 cast to the engine dtype.)
         in_buffers = [io for io in self.trt_io if io['is_input']]
         out_buffers = [io for io in self.trt_io if not io['is_input']]
+        t0 = time.perf_counter()
 
         # Heuristic mapping: the first input is left, second is right.
         left_np = left_in.transpose(2, 0, 1)[None].astype(in_buffers[0]['dtype'])
         right_np = right_in.transpose(2, 0, 1)[None].astype(in_buffers[1]['dtype'])
         np.copyto(in_buffers[0]['host'], left_np.reshape(in_buffers[0]['shape']))
         np.copyto(in_buffers[1]['host'], right_np.reshape(in_buffers[1]['shape']))
+        t_conv = time.perf_counter()
 
         for io in in_buffers:
             self._cuda.memcpy_htod(io['dev'], io['host'])
+        t_htod = time.perf_counter()
         if self._trt_use_tensor_api:
             self.trt_context.execute_async_v3(self._trt_stream.handle)
             self._trt_stream.synchronize()
         else:
             self.trt_context.execute_v2(self.trt_bindings)
+        t_exec = time.perf_counter()
         for io in out_buffers:
             self._cuda.memcpy_dtoh(io['host'], io['dev'])
+        t_dtoh = time.perf_counter()
 
         # Outputs assumed in the order: disparity, occlusion, confidence (matches
         # S2M2's export_tensorrt.py). Squeeze to (H, W).
         disp = np.squeeze(out_buffers[0]['host']).astype(np.float32)
         occ = np.squeeze(out_buffers[1]['host']).astype(np.float32)
         conf = np.squeeze(out_buffers[2]['host']).astype(np.float32)
+        t_out = time.perf_counter()
+        self._last_infer_timing = {
+            'conv': (t_conv - t0) * 1e3,
+            'htod': (t_htod - t_conv) * 1e3,
+            'exec': (t_exec - t_htod) * 1e3,
+            'dtoh': (t_dtoh - t_exec) * 1e3,
+            'out': (t_out - t_dtoh) * 1e3,
+        }
         return disp, occ, conf
 
 
