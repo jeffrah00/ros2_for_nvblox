@@ -86,6 +86,7 @@ class CustomStereoDepthNode(Node):
         self._fps_frame_count = 0
         self._fps_stage_acc = {}  # stage name -> accumulated ms within the window
         self._logged_first_frame = False
+        self._prev_callback_end = None  # perf_counter at end of previous on_stereo
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -310,7 +311,11 @@ class CustomStereoDepthNode(Node):
                 f'first frame: input {w_orig}x{h_orig} -> inference {W}x{H} ({mode}); '
                 f'backend={self.backend}')
 
+        idle_ms = ((t_start - self._prev_callback_end) * 1e3
+                   if self._prev_callback_end is not None else 0.0)
+        self._prev_callback_end = t_pub
         self._update_fps({
+            'idle': idle_ms,
             'decode': (t_decode - t_start) * 1e3,
             'pre': (t_pre - t_decode) * 1e3,
             'infer': (t_infer - t_pre) * 1e3,
