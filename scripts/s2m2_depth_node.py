@@ -62,6 +62,9 @@ class S2M2DepthNode(Node):
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('fps_log_period', 5.0)
         self.declare_parameter('stall_warn_ms', 250.0)
+        self.declare_parameter('use_cuda_graph', True)
+        self.declare_parameter('use_sensor_qos', False)
+        self.declare_parameter('process_every_n', 1)
 
         self.cfg_width = int(self.get_parameter('width').value)
         self.cfg_height = int(self.get_parameter('height').value)
@@ -76,6 +79,8 @@ class S2M2DepthNode(Node):
         self.mask_low_conf = bool(self.get_parameter('mask_low_confidence').value)
         self._fps_log_period_s = float(self.get_parameter('fps_log_period').value)
         self._stall_warn_ms = float(self.get_parameter('stall_warn_ms').value)
+        self._process_every_n = max(1, int(self.get_parameter('process_every_n').value))
+        self._sync_count = 0
         self._fps_window_start = time.perf_counter()
         self._fps_frame_count = 0
         self._fps_stage_acc = {}  # stage name -> accumulated ms within the window
@@ -147,7 +152,7 @@ class S2M2DepthNode(Node):
                     self.trt_context.set_input_shape(name, (1, 3, H, W))
                     shape = tuple(self.trt_context.get_tensor_shape(name))
                 dtype = trt.nptype(self.trt_engine.get_tensor_dtype(name))
-                host_buf = np.empty(shape, dtype=dtype)
+                host_buf = cuda.pagelocked_empty(shape, dtype)  # page-locked: fast DMA, graph-capturable
                 dev_buf = cuda.mem_alloc(host_buf.nbytes)
                 self.trt_context.set_tensor_address(name, int(dev_buf))
                 self.trt_io.append({
@@ -166,7 +171,7 @@ class S2M2DepthNode(Node):
                     self.trt_context.set_binding_shape(i, (1, 3, H, W))
                     shape = (1, 3, H, W)
                 dtype = trt.nptype(self.trt_engine.get_binding_dtype(i))
-                host_buf = np.empty(shape, dtype=dtype)
+                host_buf = cuda.pagelocked_empty(shape, dtype)
                 dev_buf = cuda.mem_alloc(host_buf.nbytes)
                 self.trt_bindings[i] = int(dev_buf)
                 self.trt_io.append({
@@ -184,6 +189,14 @@ class S2M2DepthNode(Node):
                     f'configured (height={H}, width={W}). Re-export the engine.')
                 raise SystemExit(1)
 
+        # CUDA-graph capture of H2D->execute->D2H (TRT 10+ tensor API only).
+        # Valid because the page-locked host buffers and device buffers above
+        # have fixed addresses for the node's lifetime; only their contents change.
+        self._use_cuda_graph = (bool(self.get_parameter('use_cuda_graph').value)
+                                and self._trt_use_tensor_api)
+        self._trt_graph_exec = None
+        self._trt_warmup_left = 2  # TRT needs a couple of real runs before capture
+
     # --------------------------------------------------------------------- io
     def _setup_io(self):
         left_topic = self.get_parameter('left_topic').value
@@ -192,9 +205,22 @@ class S2M2DepthNode(Node):
         out_depth = self.get_parameter('output_depth_topic').value
         out_info = self.get_parameter('output_camera_info_topic').value
 
-        left_sub = message_filters.Subscriber(self, Image, left_topic)
-        right_sub = message_filters.Subscriber(self, Image, right_topic)
-        info_sub = message_filters.Subscriber(self, CameraInfo, info_topic)
+        # Optional sensor-data QoS (BEST_EFFORT, KEEP_LAST 5). Off by default: a
+        # RELIABLE subscriber (some nvblox configs) is incompatible with a
+        # BEST_EFFORT publisher, which would silently stop depth from flowing.
+        if bool(self.get_parameter('use_sensor_qos').value):
+            from rclpy.qos import qos_profile_sensor_data
+            sub_kw = {'qos_profile': qos_profile_sensor_data}
+            pub_qos = qos_profile_sensor_data
+            plain_qos = qos_profile_sensor_data
+        else:
+            sub_kw = {}
+            pub_qos = 5
+            plain_qos = 10
+
+        left_sub = message_filters.Subscriber(self, Image, left_topic, **sub_kw)
+        right_sub = message_filters.Subscriber(self, Image, right_topic, **sub_kw)
+        info_sub = message_filters.Subscriber(self, CameraInfo, info_topic, **sub_kw)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [left_sub, right_sub, info_sub], queue_size=10, slop=0.05)
         self.sync.registerCallback(self.on_stereo)
@@ -202,15 +228,14 @@ class S2M2DepthNode(Node):
         # Lightweight extra subscriptions purely for rate measurement, independent
         # of `ros2 topic hz` (a separate subscriber): one on the left input image
         # (true in-process receive rate) and one on our own depth output (rate at
-        # which published depth actually comes back through the transport). Same
-        # default QoS as message_filters / the publishers.
+        # which published depth actually comes back through the transport).
         self._incoming_sub = self.create_subscription(
-            Image, left_topic, self._incoming_cb, 10)
+            Image, left_topic, self._incoming_cb, plain_qos)
 
-        self.pub_depth = self.create_publisher(Image, out_depth, 5)
-        self.pub_info = self.create_publisher(CameraInfo, out_info, 5)
+        self.pub_depth = self.create_publisher(Image, out_depth, pub_qos)
+        self.pub_info = self.create_publisher(CameraInfo, out_info, pub_qos)
         self._outgoing_sub = self.create_subscription(
-            Image, out_depth, self._outgoing_cb, 10)
+            Image, out_depth, self._outgoing_cb, plain_qos)
         self.get_logger().info(
             f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
             f'publishing: {out_depth}, {out_info}')
@@ -223,6 +248,9 @@ class S2M2DepthNode(Node):
 
     # --------------------------------------------------------------- callback
     def on_stereo(self, left_msg: Image, right_msg: Image, info_msg: CameraInfo):
+        self._sync_count += 1
+        if self._process_every_n > 1 and (self._sync_count % self._process_every_n):
+            return
         t_start = time.perf_counter()
         left = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding='passthrough')
         right = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='passthrough')
@@ -378,6 +406,15 @@ class S2M2DepthNode(Node):
             self._outgoing_count = 0
 
     # ----------------------------------------------------------------- trt fn
+    def _enqueue_trt_async(self, in_buffers, out_buffers):
+        """H2D copies -> execute -> D2H copies, all enqueued on self._trt_stream."""
+        stream = self._trt_stream
+        for io in in_buffers:
+            self._cuda.memcpy_htod_async(io['dev'], io['host'], stream)
+        self.trt_context.execute_async_v3(stream.handle)
+        for io in out_buffers:
+            self._cuda.memcpy_dtoh_async(io['host'], io['dev'], stream)
+
     def _trt_infer(self, left_in: np.ndarray, right_in: np.ndarray):
         # left_in/right_in are HxWx3 uint8; convert to NCHW in the engine's dtype.
         # (Engines exported expecting [0,1] float inputs should be re-exported or fed
@@ -386,28 +423,59 @@ class S2M2DepthNode(Node):
         out_buffers = [io for io in self.trt_io if not io['is_input']]
         t0 = time.perf_counter()
 
-        # Heuristic mapping: the first input is left, second is right.
-        left_np = left_in.transpose(2, 0, 1)[None].astype(in_buffers[0]['dtype'])
-        right_np = right_in.transpose(2, 0, 1)[None].astype(in_buffers[1]['dtype'])
-        np.copyto(in_buffers[0]['host'], left_np.reshape(in_buffers[0]['shape']))
-        np.copyto(in_buffers[1]['host'], right_np.reshape(in_buffers[1]['shape']))
+        # Heuristic mapping: the first input is left, second is right. transpose()
+        # + reshape() are views; np.copyto does the strided copy AND the dtype cast
+        # straight into the (page-locked) host buffer in one pass -- bit-identical
+        # to the previous astype/reshape/copyto chain, just fewer temporaries.
+        np.copyto(in_buffers[0]['host'],
+                  left_in.transpose(2, 0, 1).reshape(in_buffers[0]['shape']))
+        np.copyto(in_buffers[1]['host'],
+                  right_in.transpose(2, 0, 1).reshape(in_buffers[1]['shape']))
         t_conv = time.perf_counter()
 
-        for io in in_buffers:
-            self._cuda.memcpy_htod(io['dev'], io['host'])
-        t_htod = time.perf_counter()
-        if self._trt_use_tensor_api:
-            self.trt_context.execute_async_v3(self._trt_stream.handle)
-            self._trt_stream.synchronize()
-        else:
+        if self._trt_stream is None:
+            # Legacy TRT<=9 path: synchronous binding API, unchanged behaviour.
+            for io in in_buffers:
+                self._cuda.memcpy_htod(io['dev'], io['host'])
+            t_htod = time.perf_counter()
             self.trt_context.execute_v2(self.trt_bindings)
-        t_exec = time.perf_counter()
-        for io in out_buffers:
-            self._cuda.memcpy_dtoh(io['host'], io['dev'])
-        t_dtoh = time.perf_counter()
+            t_exec = time.perf_counter()
+            for io in out_buffers:
+                self._cuda.memcpy_dtoh(io['host'], io['dev'])
+            t_dtoh = time.perf_counter()
+        else:
+            stream = self._trt_stream
+            if not self._use_cuda_graph or self._trt_warmup_left > 0:
+                self._enqueue_trt_async(in_buffers, out_buffers)
+                if self._trt_warmup_left > 0:
+                    self._trt_warmup_left -= 1
+            elif self._trt_graph_exec is None:
+                try:
+                    stream.begin_capture()
+                    self._enqueue_trt_async(in_buffers, out_buffers)
+                    graph = stream.end_capture()
+                    self._trt_graph_exec = graph.instantiate()
+                    self._trt_graph_exec.launch(stream)
+                    self.get_logger().info('CUDA graph captured for TRT inference.')
+                except Exception as e:  # pycuda graph API varies; degrade gracefully
+                    self._use_cuda_graph = False
+                    self._trt_graph_exec = None
+                    try:
+                        stream.end_capture()  # in case capture was left open
+                    except Exception:
+                        pass
+                    self.get_logger().warn(
+                        f'CUDA graph capture failed ({e}); using plain async enqueue.')
+                    self._enqueue_trt_async(in_buffers, out_buffers)
+            else:
+                self._trt_graph_exec.launch(stream)
+            t_htod = t_conv  # async: H2D/exec/D2H overlap on the stream
+            stream.synchronize()
+            t_exec = t_dtoh = time.perf_counter()
 
         # Outputs assumed in the order: disparity, occlusion, confidence (matches
-        # S2M2's export_tensorrt.py). Squeeze to (H, W).
+        # S2M2's export_tensorrt.py). Squeeze to (H, W) and copy out of the pinned
+        # buffer (astype always copies) before the next frame overwrites it.
         disp = np.squeeze(out_buffers[0]['host']).astype(np.float32)
         occ = np.squeeze(out_buffers[1]['host']).astype(np.float32)
         conf = np.squeeze(out_buffers[2]['host']).astype(np.float32)
