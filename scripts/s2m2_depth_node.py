@@ -13,6 +13,7 @@ original input dimensions.
 
 import os
 import sys
+import time
 
 import numpy as np
 import cv2
@@ -59,6 +60,7 @@ class S2M2DepthNode(Node):
         self.declare_parameter('mask_occluded', True)
         self.declare_parameter('mask_low_confidence', True)
         self.declare_parameter('device', 'cuda')
+        self.declare_parameter('fps_log_period', 5.0)
 
         self.cfg_width = int(self.get_parameter('width').value)
         self.cfg_height = int(self.get_parameter('height').value)
@@ -71,6 +73,10 @@ class S2M2DepthNode(Node):
         self.baseline_m = float(self.get_parameter('baseline_m').value)
         self.mask_occluded = bool(self.get_parameter('mask_occluded').value)
         self.mask_low_conf = bool(self.get_parameter('mask_low_confidence').value)
+        self._fps_log_period_s = float(self.get_parameter('fps_log_period').value)
+        self._fps_window_start = time.perf_counter()
+        self._fps_frame_count = 0
+        self._fps_infer_time_acc = 0.0
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -229,6 +235,7 @@ class S2M2DepthNode(Node):
         right_t = torch.from_numpy(right_in).permute(2, 0, 1).unsqueeze(0).to(self.device)
 
         # Inference.
+        t0 = time.perf_counter()
         if self.backend == 'torch':
             from s2m2.core.utils.model_utils import run_stereo_matching
             disp_t, occ_t, conf_t, _, _ = run_stereo_matching(
@@ -238,6 +245,7 @@ class S2M2DepthNode(Node):
             conf = conf_t.squeeze().detach().cpu().numpy()
         else:
             disp, occ, conf = self._trt_infer(left_t, right_t)
+        infer_ms = (time.perf_counter() - t0) * 1e3
 
         # Disparity -> depth at the inference resolution.
         fx_used = float(info_msg.k[0]) * sx
@@ -279,6 +287,24 @@ class S2M2DepthNode(Node):
         info_out.binning_y = info_msg.binning_y
         info_out.roi = info_msg.roi
         self.pub_info.publish(info_out)
+
+        self._update_fps(infer_ms)
+
+    # ----------------------------------------------------------------- fps log
+    def _update_fps(self, infer_ms: float):
+        if self._fps_log_period_s <= 0.0:
+            return
+        self._fps_frame_count += 1
+        self._fps_infer_time_acc += infer_ms
+        elapsed = time.perf_counter() - self._fps_window_start
+        if elapsed >= self._fps_log_period_s:
+            count = self._fps_frame_count
+            self.get_logger().info(
+                f'FPS: {count / elapsed:.1f} ({count} frames in {elapsed:.1f}s) | '
+                f'avg inference: {self._fps_infer_time_acc / count:.1f} ms')
+            self._fps_window_start = time.perf_counter()
+            self._fps_frame_count = 0
+            self._fps_infer_time_acc = 0.0
 
     # ----------------------------------------------------------------- trt fn
     def _trt_infer(self, left_t: torch.Tensor, right_t: torch.Tensor):

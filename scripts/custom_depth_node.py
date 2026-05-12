@@ -25,6 +25,7 @@ Model interface assumed:
 
 import os
 import sys
+import time
 
 import numpy as np
 import cv2
@@ -67,6 +68,7 @@ class CustomStereoDepthNode(Node):
         self.declare_parameter('confidence_threshold', 0.0)
         self.declare_parameter('input_scale', 1.0 / 255.0)
         self.declare_parameter('device', 'cuda')
+        self.declare_parameter('fps_log_period', 5.0)
 
         self.cfg_width = int(self.get_parameter('width').value)
         self.cfg_height = int(self.get_parameter('height').value)
@@ -79,6 +81,10 @@ class CustomStereoDepthNode(Node):
         self.baseline_m = float(self.get_parameter('baseline_m').value)
         self.conf_thr = float(self.get_parameter('confidence_threshold').value)
         self.input_scale = float(self.get_parameter('input_scale').value)
+        self._fps_log_period_s = float(self.get_parameter('fps_log_period').value)
+        self._fps_window_start = time.perf_counter()
+        self._fps_frame_count = 0
+        self._fps_infer_time_acc = 0.0
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -245,10 +251,12 @@ class CustomStereoDepthNode(Node):
         right_np = (right_in.transpose(2, 0, 1)[None].astype(np.float32) * self.input_scale)
 
         # Inference.
+        t0 = time.perf_counter()
         if self.backend == 'onnx':
             disp, occ, conf = self._onnx_infer(left_np, right_np)
         else:
             disp, occ, conf = self._trt_infer(left_np, right_np)
+        infer_ms = (time.perf_counter() - t0) * 1e3
 
         # Disparity -> depth at the inference resolution.
         fx_used = float(info_msg.k[0]) * sx
@@ -290,6 +298,24 @@ class CustomStereoDepthNode(Node):
         info_out.binning_y = info_msg.binning_y
         info_out.roi = info_msg.roi
         self.pub_info.publish(info_out)
+
+        self._update_fps(infer_ms)
+
+    # ----------------------------------------------------------------- fps log
+    def _update_fps(self, infer_ms: float):
+        if self._fps_log_period_s <= 0.0:
+            return
+        self._fps_frame_count += 1
+        self._fps_infer_time_acc += infer_ms
+        elapsed = time.perf_counter() - self._fps_window_start
+        if elapsed >= self._fps_log_period_s:
+            count = self._fps_frame_count
+            self.get_logger().info(
+                f'FPS: {count / elapsed:.1f} ({count} frames in {elapsed:.1f}s) | '
+                f'avg inference: {self._fps_infer_time_acc / count:.1f} ms')
+            self._fps_window_start = time.perf_counter()
+            self._fps_frame_count = 0
+            self._fps_infer_time_acc = 0.0
 
     # ---------------------------------------------------------------- onnx fn
     def _onnx_infer(self, left_np: np.ndarray, right_np: np.ndarray):
