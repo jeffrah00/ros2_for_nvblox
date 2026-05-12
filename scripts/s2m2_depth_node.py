@@ -61,6 +61,7 @@ class S2M2DepthNode(Node):
         self.declare_parameter('mask_low_confidence', True)
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('fps_log_period', 5.0)
+        self.declare_parameter('stall_warn_ms', 250.0)
 
         self.cfg_width = int(self.get_parameter('width').value)
         self.cfg_height = int(self.get_parameter('height').value)
@@ -74,13 +75,16 @@ class S2M2DepthNode(Node):
         self.mask_occluded = bool(self.get_parameter('mask_occluded').value)
         self.mask_low_conf = bool(self.get_parameter('mask_low_confidence').value)
         self._fps_log_period_s = float(self.get_parameter('fps_log_period').value)
+        self._stall_warn_ms = float(self.get_parameter('stall_warn_ms').value)
         self._fps_window_start = time.perf_counter()
         self._fps_frame_count = 0
         self._fps_stage_acc = {}  # stage name -> accumulated ms within the window
+        self._fps_stage_max = {}  # stage name -> max ms within the window
         self._logged_first_frame = False
         self._prev_callback_end = None  # perf_counter at end of previous on_stereo
         self._last_infer_timing = {}    # sub-stage ms from the last inference call
         self._incoming_count = 0        # left-image msgs received since last FPS log
+        self._outgoing_count = 0        # depth msgs delivered back to us since last log
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -195,20 +199,27 @@ class S2M2DepthNode(Node):
             [left_sub, right_sub, info_sub], queue_size=10, slop=0.05)
         self.sync.registerCallback(self.on_stereo)
 
-        # Lightweight extra subscription on the left image purely to measure the
-        # rate this process actually receives, independent of `ros2 topic hz`
-        # (which is a separate subscriber). Same (default) QoS as message_filters.
+        # Lightweight extra subscriptions purely for rate measurement, independent
+        # of `ros2 topic hz` (a separate subscriber): one on the left input image
+        # (true in-process receive rate) and one on our own depth output (rate at
+        # which published depth actually comes back through the transport). Same
+        # default QoS as message_filters / the publishers.
         self._incoming_sub = self.create_subscription(
             Image, left_topic, self._incoming_cb, 10)
 
         self.pub_depth = self.create_publisher(Image, out_depth, 5)
         self.pub_info = self.create_publisher(CameraInfo, out_info, 5)
+        self._outgoing_sub = self.create_subscription(
+            Image, out_depth, self._outgoing_cb, 10)
         self.get_logger().info(
             f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
             f'publishing: {out_depth}, {out_info}')
 
     def _incoming_cb(self, _msg: Image):
         self._incoming_count += 1
+
+    def _outgoing_cb(self, _msg: Image):
+        self._outgoing_count += 1
 
     # --------------------------------------------------------------- callback
     def on_stereo(self, left_msg: Image, right_msg: Image, info_msg: CameraInfo):
@@ -333,6 +344,11 @@ class S2M2DepthNode(Node):
         stages.update(self._last_infer_timing)
         stages['post'] = (t_post - t_infer) * 1e3
         stages['pub'] = (t_pub - t_post) * 1e3
+        if self._stall_warn_ms > 0.0:
+            big = {k: v for k, v in stages.items() if v >= self._stall_warn_ms}
+            if big:
+                self.get_logger().warn(
+                    'long gap: ' + ', '.join(f'{k}={v:.0f}ms' for k, v in big.items()))
         self._update_fps(stages)
 
     # ----------------------------------------------------------------- fps log
@@ -342,18 +358,24 @@ class S2M2DepthNode(Node):
         self._fps_frame_count += 1
         for name, ms in stage_ms.items():
             self._fps_stage_acc[name] = self._fps_stage_acc.get(name, 0.0) + ms
+            if ms > self._fps_stage_max.get(name, 0.0):
+                self._fps_stage_max[name] = ms
         elapsed = time.perf_counter() - self._fps_window_start
         if elapsed >= self._fps_log_period_s:
             count = self._fps_frame_count
             breakdown = ' | '.join(
-                f'{name} {self._fps_stage_acc[name] / count:.1f}' for name in stage_ms)
+                f'{name} {self._fps_stage_acc[name] / count:.1f}/{self._fps_stage_max[name]:.0f}'
+                for name in stage_ms)
             self.get_logger().info(
                 f'FPS: {count / elapsed:.1f} (in {self._incoming_count / elapsed:.1f} Hz, '
-                f'{count} frames in {elapsed:.1f}s) | {breakdown} ms (avg)')
+                f'out {self._outgoing_count / elapsed:.1f} Hz, {count} frames in {elapsed:.1f}s) | '
+                f'{breakdown} ms (avg/max)')
             self._fps_window_start = time.perf_counter()
             self._fps_frame_count = 0
             self._fps_stage_acc = {}
+            self._fps_stage_max = {}
             self._incoming_count = 0
+            self._outgoing_count = 0
 
     # ----------------------------------------------------------------- trt fn
     def _trt_infer(self, left_in: np.ndarray, right_in: np.ndarray):
