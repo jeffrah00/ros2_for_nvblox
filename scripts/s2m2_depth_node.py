@@ -389,7 +389,6 @@ class S2M2DepthNode(Node):
             'idle': idle_ms,
             'decode': (t_decode - t_start) * 1e3,
             'pre': (t_pre - t_decode) * 1e3,
-            'infer': (t_infer - t_pre) * 1e3,
         }
         stages.update(self._last_infer_timing)
         stages['post'] = (t_post - t_infer) * 1e3
