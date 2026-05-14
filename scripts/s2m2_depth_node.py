@@ -63,6 +63,12 @@ class S2M2DepthNode(Node):
         self.declare_parameter('fps_log_period', 5.0)
         self.declare_parameter('stall_warn_ms', 250.0)
         self.declare_parameter('use_cuda_graph', True)
+        # Pipelined inference: overlap CPU prep/post of frame N+1 with GPU
+        # exec of frame N using two sets of pinned host + device buffers.
+        # Adds ~one frame interval of publish latency (invisible to nvblox).
+        # TRT 10+ tensor-name API only. Forces CUDA graph off (the captured
+        # graph would bake one slot's addresses).
+        self.declare_parameter('use_pipeline', True)
         self.declare_parameter('use_sensor_qos', False)
         self.declare_parameter('process_every_n', 1)
 
@@ -201,6 +207,43 @@ class S2M2DepthNode(Node):
         self._trt_graph_exec = None
         self._trt_warmup_left = 2  # TRT needs a couple of real runs before capture
 
+        # Pipelined inference: two buffer slots so frame N+1's H2D + CPU prep
+        # overlap with frame N's GPU exec. Each callback (a) syncs the stream
+        # to recover the PREVIOUS frame's outputs, publishes them, then
+        # (b) enqueues the CURRENT frame's H2D+exec+D2H async and returns.
+        # Steady-state callback period = max(GPU exec, CPU work) = GPU exec.
+        # Requires tensor-name API (set_tensor_address per-frame); forces
+        # use_cuda_graph off (the captured graph would bake one slot's addrs).
+        self._use_pipeline = (bool(self.get_parameter('use_pipeline').value)
+                              and self._trt_use_tensor_api)
+        if self._use_pipeline:
+            if self._use_cuda_graph:
+                self.get_logger().info(
+                    'use_pipeline=True -> disabling CUDA graph capture '
+                    '(graph would bake a single slot\'s addresses).')
+                self._use_cuda_graph = False
+            # Allocate slot B with the same shapes/dtypes as slot A. Slot A
+            # is self.trt_io as built above; slot B mirrors it.
+            self.trt_io_b = []
+            for io_a in self.trt_io:
+                host_buf = cuda.pagelocked_empty(io_a['shape'], io_a['dtype'])
+                dev_buf = cuda.mem_alloc(host_buf.nbytes)
+                self.trt_io_b.append({
+                    'name': io_a['name'], 'is_input': io_a['is_input'],
+                    'shape': io_a['shape'], 'dtype': io_a['dtype'],
+                    'host': host_buf, 'dev': dev_buf,
+                })
+            self._trt_io_slots = [self.trt_io, self.trt_io_b]
+            self._next_slot = 0
+            # Holds state captured at enqueue time for the in-flight frame so
+            # we can publish it when its stream work completes one callback later.
+            self._prev_frame = None
+            self.get_logger().info(
+                'Pipelined TRT inference enabled (2 buffer slots, single context, '
+                'single stream, no CUDA graph).')
+        else:
+            self._trt_io_slots = None
+
     # --------------------------------------------------------------------- io
     def _setup_io(self):
         left_topic = self.get_parameter('left_topic').value
@@ -290,6 +333,16 @@ class S2M2DepthNode(Node):
             mode = 'crop'
 
         t_pre = time.perf_counter()
+
+        # Pipelined TRT path: this callback enqueues N's GPU work async and
+        # publishes the PREVIOUS frame's result. Returns immediately after
+        # enqueue. See _trt_pipelined_step.
+        if self.backend == 'trt' and self._use_pipeline:
+            self._trt_pipelined_step(
+                left_in, right_in, info_msg, left_msg.header,
+                h_orig, w_orig, sx, sy, ox, oy, H, W, mode,
+                t_start, t_decode, t_pre)
+            return
 
         # Inference. Each branch fills self._last_infer_timing with sub-stage ms.
         if self.backend == 'torch':
@@ -393,6 +446,172 @@ class S2M2DepthNode(Node):
         stages.update(self._last_infer_timing)
         stages['post'] = (t_post - t_infer) * 1e3
         stages['pub'] = (t_pub - t_post) * 1e3
+        if self._stall_warn_ms > 0.0:
+            big = {k: v for k, v in stages.items() if v >= self._stall_warn_ms}
+            if big:
+                self.get_logger().warn(
+                    'long gap: ' + ', '.join(f'{k}={v:.0f}ms' for k, v in big.items()))
+        self._update_fps(stages)
+
+    # --------------------------------------------------------- pipelined step
+    def _trt_pipelined_step(self, left_in, right_in, info_msg, header,
+                            h_orig, w_orig, sx, sy, ox, oy, H, W, mode,
+                            t_start, t_decode, t_pre):
+        """Two-slot pipelined inference.
+
+        Each callback:
+          1. np.copyto's the current frame N's input into slot[next]'s pinned host.
+          2. Syncs the stream to recover the PREVIOUS frame's outputs (already
+             enqueued one callback ago; on the very first frame nothing is waiting).
+          3. Computes & publishes the PREVIOUS frame's depth.
+          4. Binds the TRT context to slot[next]'s addresses and enqueues
+             H2D + execute + D2H async on the stream. Does NOT synchronize.
+          5. Stashes N's per-frame state for the next callback to consume.
+
+        Steady-state callback period drops from (CPU + GPU) to max(CPU, GPU)
+        = GPU exec (the dominant term). Adds one frame interval of publish
+        latency.
+        """
+        slot_idx = self._next_slot
+        self._next_slot ^= 1
+        slot = self._trt_io_slots[slot_idx]
+        in_bufs = [io for io in slot if io['is_input']]
+        out_bufs = [io for io in slot if not io['is_input']]
+
+        # 1) Copy N's inputs into slot's pinned host buffer (np.copyto handles
+        #    the strided->contiguous + dtype cast in one pass, exactly like
+        #    the non-pipelined path).
+        np.copyto(in_bufs[0]['host'],
+                  left_in.transpose(2, 0, 1).reshape(in_bufs[0]['shape']))
+        np.copyto(in_bufs[1]['host'],
+                  right_in.transpose(2, 0, 1).reshape(in_bufs[1]['shape']))
+        t_conv = time.perf_counter()
+
+        # 2) Sync the stream -- waits for the PREVIOUS frame's H2D/exec/D2H
+        #    on the same stream to finish. First frame: nothing in flight.
+        if self._prev_frame is not None:
+            self._trt_stream.synchronize()
+        t_sync = time.perf_counter()
+
+        # 3) Publish the PREVIOUS frame (its outputs are now in its slot's
+        #    pinned host buffers).
+        if self._prev_frame is not None:
+            prev = self._prev_frame
+            prev_slot = self._trt_io_slots[prev['slot_idx']]
+            prev_out = [io for io in prev_slot if not io['is_input']]
+            # Engine outputs: disparity, occlusion, confidence (S2M2 export order).
+            disp = np.squeeze(prev_out[0]['host']).astype(np.float32)
+            occ = np.squeeze(prev_out[1]['host']).astype(np.float32)
+            conf = np.squeeze(prev_out[2]['host']).astype(np.float32)
+
+            valid = disp > 1e-3
+            if self.mask_occluded:
+                valid &= (occ >= 0.5)
+            if self.mask_low_conf:
+                valid &= (conf >= 0.5)
+            if self._depth_buf is None or self._depth_buf.shape != disp.shape:
+                self._depth_buf = np.zeros(disp.shape, dtype=np.float32)
+            depth = self._depth_buf
+            depth.fill(0.0)
+            np.divide(prev['fx_used'] * self.baseline_m, disp,
+                      out=depth, where=valid)
+
+            # Restore to prev's original dimensions.
+            if prev['mode'] == 'resize':
+                depth_full = cv2.resize(
+                    depth, (prev['w_orig'], prev['h_orig']),
+                    interpolation=cv2.INTER_NEAREST)
+            else:
+                if (self._depth_full_buf is None
+                        or self._depth_full_buf.shape != (prev['h_orig'], prev['w_orig'])):
+                    self._depth_full_buf = np.zeros(
+                        (prev['h_orig'], prev['w_orig']), dtype=np.float32)
+                depth_full = self._depth_full_buf
+                # Border may carry stale values from a previous frame at a
+                # different crop offset; cheap to wipe.
+                depth_full.fill(0.0)
+                depth_full[prev['oy']:prev['oy']+prev['H'],
+                           prev['ox']:prev['ox']+prev['W']] = depth
+            t_post = time.perf_counter()
+
+            # Publish prev's depth Image.
+            if self._depth_msg is None:
+                self._depth_msg = Image()
+                self._depth_msg.encoding = '32FC1'
+                self._depth_msg.is_bigendian = 0
+            depth_msg = self._depth_msg
+            depth_msg.height = depth_full.shape[0]
+            depth_msg.width = depth_full.shape[1]
+            depth_msg.step = depth_full.shape[1] * 4
+            depth_msg.header = prev['header']
+            depth_msg.data = depth_full.tobytes()
+            self.pub_depth.publish(depth_msg)
+
+            # Publish prev's CameraInfo (cached, refreshed only on k change).
+            prev_info = prev['info_msg']
+            if (self._info_out is None
+                    or list(self._info_out.k) != list(prev_info.k)):
+                info_out = CameraInfo()
+                info_out.height = prev_info.height
+                info_out.width = prev_info.width
+                info_out.distortion_model = prev_info.distortion_model
+                info_out.d = list(prev_info.d)
+                info_out.k = list(prev_info.k)
+                info_out.r = list(prev_info.r)
+                info_out.p = list(prev_info.p)
+                info_out.binning_x = prev_info.binning_x
+                info_out.binning_y = prev_info.binning_y
+                info_out.roi = prev_info.roi
+                self._info_out = info_out
+            self._info_out.header = prev['header']
+            self.pub_info.publish(self._info_out)
+            t_pub = time.perf_counter()
+        else:
+            t_post = t_pub = t_sync
+
+        # 4) Bind context to N's slot and enqueue async work on the stream.
+        #    set_tensor_address per-frame is cheap (microseconds) and what
+        #    makes the captured CUDA-graph path incompatible with pipelining.
+        for io in slot:
+            self.trt_context.set_tensor_address(io['name'], int(io['dev']))
+        for io in in_bufs:
+            self._cuda.memcpy_htod_async(io['dev'], io['host'], self._trt_stream)
+        self.trt_context.execute_async_v3(self._trt_stream.handle)
+        for io in out_bufs:
+            self._cuda.memcpy_dtoh_async(io['host'], io['dev'], self._trt_stream)
+        t_enq = time.perf_counter()
+
+        # 5) Save N's state for the next callback to publish.
+        fx_used = float(info_msg.k[0]) * sx
+        self._prev_frame = {
+            'slot_idx': slot_idx,
+            'header': header,
+            'info_msg': info_msg,
+            'h_orig': h_orig, 'w_orig': w_orig,
+            'sx': sx, 'sy': sy, 'ox': ox, 'oy': oy,
+            'H': H, 'W': W, 'mode': mode,
+            'fx_used': fx_used,
+        }
+
+        if not self._logged_first_frame:
+            self._logged_first_frame = True
+            self.get_logger().info(
+                f'first frame (pipelined): input {w_orig}x{h_orig} -> '
+                f'inference {W}x{H} ({mode}); backend=trt, device={self.device}')
+
+        idle_ms = ((t_start - self._prev_callback_end) * 1e3
+                   if self._prev_callback_end is not None else 0.0)
+        self._prev_callback_end = t_enq
+        stages = {
+            'idle': idle_ms,
+            'decode': (t_decode - t_start) * 1e3,
+            'pre': (t_pre - t_decode) * 1e3,
+            'conv': (t_conv - t_pre) * 1e3,
+            'sync': (t_sync - t_conv) * 1e3,   # wait for prev's GPU work
+            'post': (t_post - t_sync) * 1e3,   # prev's mask + restore
+            'pub': (t_pub - t_post) * 1e3,     # prev's publish
+            'enq': (t_enq - t_pub) * 1e3,      # N's async enqueue (microseconds)
+        }
         if self._stall_warn_ms > 0.0:
             big = {k: v for k, v in stages.items() if v >= self._stall_warn_ms}
             if big:
