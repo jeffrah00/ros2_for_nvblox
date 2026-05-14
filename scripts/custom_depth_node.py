@@ -25,6 +25,7 @@ Model interface assumed:
 
 import os
 import sys
+import time
 
 import numpy as np
 import cv2
@@ -67,6 +68,11 @@ class CustomStereoDepthNode(Node):
         self.declare_parameter('confidence_threshold', 0.0)
         self.declare_parameter('input_scale', 1.0 / 255.0)
         self.declare_parameter('device', 'cuda')
+        self.declare_parameter('fps_log_period', 5.0)
+        self.declare_parameter('stall_warn_ms', 250.0)
+        self.declare_parameter('use_cuda_graph', True)
+        self.declare_parameter('use_sensor_qos', False)
+        self.declare_parameter('process_every_n', 1)
 
         self.cfg_width = int(self.get_parameter('width').value)
         self.cfg_height = int(self.get_parameter('height').value)
@@ -79,6 +85,23 @@ class CustomStereoDepthNode(Node):
         self.baseline_m = float(self.get_parameter('baseline_m').value)
         self.conf_thr = float(self.get_parameter('confidence_threshold').value)
         self.input_scale = float(self.get_parameter('input_scale').value)
+        self._fps_log_period_s = float(self.get_parameter('fps_log_period').value)
+        self._stall_warn_ms = float(self.get_parameter('stall_warn_ms').value)
+        self._process_every_n = max(1, int(self.get_parameter('process_every_n').value))
+        self._sync_count = 0
+        self._fps_window_start = time.perf_counter()
+        self._fps_frame_count = 0
+        self._fps_stage_acc = {}  # stage name -> accumulated ms within the window
+        self._fps_stage_max = {}  # stage name -> max ms within the window
+        self._logged_first_frame = False
+        self._prev_callback_end = None  # perf_counter at end of previous on_stereo
+        self._last_infer_timing = {}    # sub-stage ms from the last inference call
+        self._incoming_count = 0        # left-image msgs received since last FPS log
+        self._outgoing_count = 0        # depth msgs delivered back to us since last log
+        self._depth_buf = None          # reused (H,W) float32 depth-at-inference-res
+        self._depth_full_buf = None     # reused (h_orig,w_orig) float32 output (crop mode)
+        self._depth_msg = None          # reused Image msg for the depth output
+        self._info_out = None           # cached CameraInfo (intrinsics are static)
 
     # ----------------------------------------------------------------- backend
     def _setup_backend(self):
@@ -149,7 +172,7 @@ class CustomStereoDepthNode(Node):
                     self.trt_context.set_input_shape(name, (1, 3, H, W))
                     shape = tuple(self.trt_context.get_tensor_shape(name))
                 dtype = trt.nptype(self.trt_engine.get_tensor_dtype(name))
-                host_buf = np.empty(shape, dtype=dtype)
+                host_buf = cuda.pagelocked_empty(shape, dtype)  # page-locked: fast DMA, graph-capturable
                 dev_buf = cuda.mem_alloc(host_buf.nbytes)
                 self.trt_context.set_tensor_address(name, int(dev_buf))
                 self.trt_io.append({
@@ -167,7 +190,7 @@ class CustomStereoDepthNode(Node):
                     self.trt_context.set_binding_shape(i, (1, 3, H, W))
                     shape = (1, 3, H, W)
                 dtype = trt.nptype(self.trt_engine.get_binding_dtype(i))
-                host_buf = np.empty(shape, dtype=dtype)
+                host_buf = cuda.pagelocked_empty(shape, dtype)
                 dev_buf = cuda.mem_alloc(host_buf.nbytes)
                 self.trt_bindings[i] = int(dev_buf)
                 self.trt_io.append({
@@ -187,6 +210,14 @@ class CustomStereoDepthNode(Node):
                 f'Engine has {n_out} outputs; expected 1 (disp), 2 (disp, occ), or 3 (disp, occ, conf).')
             raise SystemExit(1)
 
+        # CUDA-graph capture of H2D->execute->D2H (TRT 10+ tensor API only).
+        # Valid because the page-locked host buffers and device buffers above
+        # have fixed addresses for the node's lifetime; only their contents change.
+        self._use_cuda_graph = (bool(self.get_parameter('use_cuda_graph').value)
+                                and self._trt_use_tensor_api)
+        self._trt_graph_exec = None
+        self._trt_warmup_left = 2  # TRT needs a couple of real runs before capture
+
     # --------------------------------------------------------------------- io
     def _setup_io(self):
         left_topic = self.get_parameter('left_topic').value
@@ -195,21 +226,53 @@ class CustomStereoDepthNode(Node):
         out_depth = self.get_parameter('output_depth_topic').value
         out_info = self.get_parameter('output_camera_info_topic').value
 
-        left_sub = message_filters.Subscriber(self, Image, left_topic)
-        right_sub = message_filters.Subscriber(self, Image, right_topic)
-        info_sub = message_filters.Subscriber(self, CameraInfo, info_topic)
+        # Optional sensor-data QoS (BEST_EFFORT, KEEP_LAST 5). Off by default: a
+        # RELIABLE subscriber (some nvblox configs) is incompatible with a
+        # BEST_EFFORT publisher, which would silently stop depth from flowing.
+        if bool(self.get_parameter('use_sensor_qos').value):
+            from rclpy.qos import qos_profile_sensor_data
+            sub_kw = {'qos_profile': qos_profile_sensor_data}
+            pub_qos = qos_profile_sensor_data
+            plain_qos = qos_profile_sensor_data
+        else:
+            sub_kw = {}
+            pub_qos = 5
+            plain_qos = 10
+
+        left_sub = message_filters.Subscriber(self, Image, left_topic, **sub_kw)
+        right_sub = message_filters.Subscriber(self, Image, right_topic, **sub_kw)
+        info_sub = message_filters.Subscriber(self, CameraInfo, info_topic, **sub_kw)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [left_sub, right_sub, info_sub], queue_size=10, slop=0.05)
         self.sync.registerCallback(self.on_stereo)
 
-        self.pub_depth = self.create_publisher(Image, out_depth, 5)
-        self.pub_info = self.create_publisher(CameraInfo, out_info, 5)
+        # Lightweight extra subscriptions purely for rate measurement, independent
+        # of `ros2 topic hz` (a separate subscriber): one on the left input image
+        # (true in-process receive rate) and one on our own depth output (rate at
+        # which published depth actually comes back through the transport).
+        self._incoming_sub = self.create_subscription(
+            Image, left_topic, self._incoming_cb, plain_qos)
+
+        self.pub_depth = self.create_publisher(Image, out_depth, pub_qos)
+        self.pub_info = self.create_publisher(CameraInfo, out_info, pub_qos)
+        self._outgoing_sub = self.create_subscription(
+            Image, out_depth, self._outgoing_cb, plain_qos)
         self.get_logger().info(
             f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
             f'publishing: {out_depth}, {out_info}')
 
+    def _incoming_cb(self, _msg: Image):
+        self._incoming_count += 1
+
+    def _outgoing_cb(self, _msg: Image):
+        self._outgoing_count += 1
+
     # --------------------------------------------------------------- callback
     def on_stereo(self, left_msg: Image, right_msg: Image, info_msg: CameraInfo):
+        self._sync_count += 1
+        if self._process_every_n > 1 and (self._sync_count % self._process_every_n):
+            return
+        t_start = time.perf_counter()
         left = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding='passthrough')
         right = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='passthrough')
         left = _to_3channel(left)
@@ -217,6 +280,7 @@ class CustomStereoDepthNode(Node):
         if left.dtype != np.uint8:
             left = left.astype(np.uint8)
             right = right.astype(np.uint8)
+        t_decode = time.perf_counter()
 
         h_orig, w_orig = left.shape[:2]
         if self.cfg_width and self.cfg_height:
@@ -243,88 +307,214 @@ class CustomStereoDepthNode(Node):
         # NCHW float32 with input_scale (default 1/255 -> [0,1]).
         left_np = (left_in.transpose(2, 0, 1)[None].astype(np.float32) * self.input_scale)
         right_np = (right_in.transpose(2, 0, 1)[None].astype(np.float32) * self.input_scale)
+        t_pre = time.perf_counter()
 
-        # Inference.
+        # Inference. Each branch fills self._last_infer_timing with sub-stage ms.
         if self.backend == 'onnx':
             disp, occ, conf = self._onnx_infer(left_np, right_np)
         else:
             disp, occ, conf = self._trt_infer(left_np, right_np)
+        t_infer = time.perf_counter()
 
-        # Disparity -> depth at the inference resolution.
+        # Disparity -> depth at the inference resolution. One pass: build the
+        # valid mask (incl. optional occ/conf) once, then divide into a pre-zeroed
+        # buffer. Same final result as the previous gather/scatter + masking
+        # (occ is masked-out where occ > 0.5; conf where conf < conf_thr).
         fx_used = float(info_msg.k[0]) * sx
-        depth = np.zeros_like(disp, dtype=np.float32)
         valid = disp > 1e-3
-        depth[valid] = (fx_used * self.baseline_m) / disp[valid]
-
-        # Optional masking.
-        mask = None
         if occ is not None:
-            mask = (occ > 0.5)
+            valid &= (occ <= 0.5)
         if conf is not None and self.conf_thr > 0.0:
-            cmask = (conf < self.conf_thr)
-            mask = cmask if mask is None else (mask | cmask)
-        if mask is not None:
-            depth[mask] = 0.0
+            valid &= (conf >= self.conf_thr)
+        if self._depth_buf is None or self._depth_buf.shape != disp.shape:
+            self._depth_buf = np.zeros(disp.shape, dtype=np.float32)
+        depth = self._depth_buf
+        depth.fill(0.0)
+        np.divide(fx_used * self.baseline_m, disp, out=depth, where=valid)
 
         # Restore to original dimensions.
         if mode == 'resize':
             depth_full = cv2.resize(depth, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
         else:
-            depth_full = np.zeros((h_orig, w_orig), dtype=np.float32)
+            if self._depth_full_buf is None or self._depth_full_buf.shape != (h_orig, w_orig):
+                self._depth_full_buf = np.zeros((h_orig, w_orig), dtype=np.float32)
+            depth_full = self._depth_full_buf
             depth_full[oy:oy + H, ox:ox + W] = depth
+        t_post = time.perf_counter()
 
-        depth_msg = self.bridge.cv2_to_imgmsg(depth_full, encoding='32FC1')
+        # Build the depth Image message by hand (skips cv_bridge's per-call
+        # encoding lookups / wrapper). Same bytes on the wire: cv2_to_imgmsg also
+        # just does arr.tobytes(). depth_full is C-contiguous in both modes.
+        if self._depth_msg is None:
+            self._depth_msg = Image()
+            self._depth_msg.encoding = '32FC1'
+            self._depth_msg.is_bigendian = 0
+        depth_msg = self._depth_msg
+        depth_msg.height = depth_full.shape[0]
+        depth_msg.width = depth_full.shape[1]
+        depth_msg.step = depth_full.shape[1] * 4
         depth_msg.header = left_msg.header
+        depth_msg.data = depth_full.tobytes()
         self.pub_depth.publish(depth_msg)
 
-        info_out = CameraInfo()
-        info_out.header = left_msg.header
-        info_out.height = info_msg.height
-        info_out.width = info_msg.width
-        info_out.distortion_model = info_msg.distortion_model
-        info_out.d = list(info_msg.d)
-        info_out.k = list(info_msg.k)
-        info_out.r = list(info_msg.r)
-        info_out.p = list(info_msg.p)
-        info_out.binning_x = info_msg.binning_x
-        info_out.binning_y = info_msg.binning_y
-        info_out.roi = info_msg.roi
-        self.pub_info.publish(info_out)
+        # CameraInfo intrinsics are static per camera: cache and reuse, refreshing
+        # only if k changes; each frame just stamp the header.
+        if self._info_out is None or list(self._info_out.k) != list(info_msg.k):
+            info_out = CameraInfo()
+            info_out.height = info_msg.height
+            info_out.width = info_msg.width
+            info_out.distortion_model = info_msg.distortion_model
+            info_out.d = list(info_msg.d)
+            info_out.k = list(info_msg.k)
+            info_out.r = list(info_msg.r)
+            info_out.p = list(info_msg.p)
+            info_out.binning_x = info_msg.binning_x
+            info_out.binning_y = info_msg.binning_y
+            info_out.roi = info_msg.roi
+            self._info_out = info_out
+        self._info_out.header = left_msg.header
+        self.pub_info.publish(self._info_out)
+        t_pub = time.perf_counter()
+
+        if not self._logged_first_frame:
+            self._logged_first_frame = True
+            self.get_logger().info(
+                f'first frame: input {w_orig}x{h_orig} -> inference {W}x{H} ({mode}); '
+                f'backend={self.backend}')
+
+        idle_ms = ((t_start - self._prev_callback_end) * 1e3
+                   if self._prev_callback_end is not None else 0.0)
+        self._prev_callback_end = t_pub
+        stages = {
+            'idle': idle_ms,
+            'decode': (t_decode - t_start) * 1e3,
+            'pre': (t_pre - t_decode) * 1e3,
+        }
+        stages.update(self._last_infer_timing)
+        stages['post'] = (t_post - t_infer) * 1e3
+        stages['pub'] = (t_pub - t_post) * 1e3
+        if self._stall_warn_ms > 0.0:
+            big = {k: v for k, v in stages.items() if v >= self._stall_warn_ms}
+            if big:
+                self.get_logger().warn(
+                    'long gap: ' + ', '.join(f'{k}={v:.0f}ms' for k, v in big.items()))
+        self._update_fps(stages)
+
+    # ----------------------------------------------------------------- fps log
+    def _update_fps(self, stage_ms: dict):
+        if self._fps_log_period_s <= 0.0:
+            return
+        self._fps_frame_count += 1
+        for name, ms in stage_ms.items():
+            self._fps_stage_acc[name] = self._fps_stage_acc.get(name, 0.0) + ms
+            self._fps_stage_max[name] = max(self._fps_stage_max.get(name, 0.0), ms)
+        elapsed = time.perf_counter() - self._fps_window_start
+        if elapsed >= self._fps_log_period_s:
+            count = self._fps_frame_count
+            breakdown = ' | '.join(
+                f'{name} {self._fps_stage_acc[name] / count:.1f}/{self._fps_stage_max[name]:.1f}'
+                for name in stage_ms)
+            self.get_logger().info(
+                f'FPS: {count / elapsed:.1f} (in {self._incoming_count / elapsed:.1f} Hz, '
+                f'out {self._outgoing_count / elapsed:.1f} Hz, {count} frames in {elapsed:.1f}s) | '
+                f'{breakdown} ms (avg/max)')
+            self._fps_window_start = time.perf_counter()
+            self._fps_frame_count = 0
+            self._fps_stage_acc = {}
+            self._fps_stage_max = {}
+            self._incoming_count = 0
+            self._outgoing_count = 0
 
     # ---------------------------------------------------------------- onnx fn
     def _onnx_infer(self, left_np: np.ndarray, right_np: np.ndarray):
+        t0 = time.perf_counter()
         outs = self.ort_sess.run(
             self.ort_output_names,
             {self.ort_input_names[0]: left_np,
              self.ort_input_names[1]: right_np})
+        t_exec = time.perf_counter()
         disp = np.squeeze(outs[0]).astype(np.float32)
         occ = np.squeeze(outs[1]).astype(np.float32) if len(outs) > 1 else None
         conf = np.squeeze(outs[2]).astype(np.float32) if len(outs) > 2 else None
+        t_out = time.perf_counter()
+        self._last_infer_timing = {
+            'exec': (t_exec - t0) * 1e3, 'out': (t_out - t_exec) * 1e3,
+        }
         return disp, occ, conf
 
     # ----------------------------------------------------------------- trt fn
+    def _enqueue_trt_async(self, in_buffers, out_buffers):
+        """H2D copies -> execute -> D2H copies, all enqueued on self._trt_stream."""
+        stream = self._trt_stream
+        for io in in_buffers:
+            self._cuda.memcpy_htod_async(io['dev'], io['host'], stream)
+        self.trt_context.execute_async_v3(stream.handle)
+        for io in out_buffers:
+            self._cuda.memcpy_dtoh_async(io['host'], io['dev'], stream)
+
     def _trt_infer(self, left_np: np.ndarray, right_np: np.ndarray):
         in_buffers = [io for io in self.trt_io if io['is_input']]
         out_buffers = [io for io in self.trt_io if not io['is_input']]
+        t0 = time.perf_counter()
 
-        left_np = left_np.astype(in_buffers[0]['dtype'])
-        right_np = right_np.astype(in_buffers[1]['dtype'])
+        # np.copyto casts left_np/right_np (already (1,3,H,W) float32) into the
+        # (page-locked) host buffer in one pass -- same result as the previous
+        # astype/reshape/copyto, fewer temporaries.
         np.copyto(in_buffers[0]['host'], left_np.reshape(in_buffers[0]['shape']))
         np.copyto(in_buffers[1]['host'], right_np.reshape(in_buffers[1]['shape']))
+        t_conv = time.perf_counter()
 
-        for io in in_buffers:
-            self._cuda.memcpy_htod(io['dev'], io['host'])
-        if self._trt_use_tensor_api:
-            self.trt_context.execute_async_v3(self._trt_stream.handle)
-            self._trt_stream.synchronize()
-        else:
+        if self._trt_stream is None:
+            # Legacy TRT<=9 path: synchronous binding API, unchanged behaviour.
+            for io in in_buffers:
+                self._cuda.memcpy_htod(io['dev'], io['host'])
+            t_htod = time.perf_counter()
             self.trt_context.execute_v2(self.trt_bindings)
-        for io in out_buffers:
-            self._cuda.memcpy_dtoh(io['host'], io['dev'])
+            t_exec = time.perf_counter()
+            for io in out_buffers:
+                self._cuda.memcpy_dtoh(io['host'], io['dev'])
+            t_dtoh = time.perf_counter()
+        else:
+            stream = self._trt_stream
+            if not self._use_cuda_graph or self._trt_warmup_left > 0:
+                self._enqueue_trt_async(in_buffers, out_buffers)
+                if self._trt_warmup_left > 0:
+                    self._trt_warmup_left -= 1
+            elif self._trt_graph_exec is None:
+                try:
+                    stream.begin_capture()
+                    self._enqueue_trt_async(in_buffers, out_buffers)
+                    graph = stream.end_capture()
+                    self._trt_graph_exec = graph.instantiate()
+                    self._trt_graph_exec.launch(stream)
+                    self.get_logger().info('CUDA graph captured for TRT inference.')
+                except Exception as e:  # pycuda graph API varies; degrade gracefully
+                    self._use_cuda_graph = False
+                    self._trt_graph_exec = None
+                    try:
+                        stream.end_capture()  # in case capture was left open
+                    except Exception:
+                        pass
+                    self.get_logger().warn(
+                        f'CUDA graph capture failed ({e}); using plain async enqueue.')
+                    self._enqueue_trt_async(in_buffers, out_buffers)
+            else:
+                self._trt_graph_exec.launch(stream)
+            t_htod = t_conv  # async: H2D/exec/D2H overlap on the stream
+            stream.synchronize()
+            t_exec = t_dtoh = time.perf_counter()
 
         disp = np.squeeze(out_buffers[0]['host']).astype(np.float32)
         occ = np.squeeze(out_buffers[1]['host']).astype(np.float32) if len(out_buffers) > 1 else None
         conf = np.squeeze(out_buffers[2]['host']).astype(np.float32) if len(out_buffers) > 2 else None
+        t_out = time.perf_counter()
+        self._last_infer_timing = {
+            'conv': (t_conv - t0) * 1e3,
+            'htod': (t_htod - t_conv) * 1e3,
+            'exec': (t_exec - t_htod) * 1e3,
+            'dtoh': (t_dtoh - t_exec) * 1e3,
+            'out': (t_out - t_dtoh) * 1e3,
+        }
         return disp, occ, conf
 
 
