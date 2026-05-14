@@ -65,6 +65,10 @@ class S2M2DepthNode(Node):
         self.declare_parameter('use_cuda_graph', True)
         self.declare_parameter('use_sensor_qos', False)
         self.declare_parameter('process_every_n', 1)
+        # Two extra subscriptions that re-deserialize the left image and the
+        # depth output every frame purely to count Hz. Off by default; the same
+        # numbers are available from `ros2 topic hz`.
+        self.declare_parameter('enable_rate_probes', False)
 
         self.cfg_width = int(self.get_parameter('width').value)
         self.cfg_height = int(self.get_parameter('height').value)
@@ -233,13 +237,16 @@ class S2M2DepthNode(Node):
         # of `ros2 topic hz` (a separate subscriber): one on the left input image
         # (true in-process receive rate) and one on our own depth output (rate at
         # which published depth actually comes back through the transport).
-        self._incoming_sub = self.create_subscription(
-            Image, left_topic, self._incoming_cb, plain_qos)
-
+        # Gated because each fires a Python callback that re-deserializes a full
+        # Image every frame -- 1-3 ms/frame of pure overhead at typical rates.
+        self._rate_probes = bool(self.get_parameter('enable_rate_probes').value)
         self.pub_depth = self.create_publisher(Image, out_depth, pub_qos)
         self.pub_info = self.create_publisher(CameraInfo, out_info, pub_qos)
-        self._outgoing_sub = self.create_subscription(
-            Image, out_depth, self._outgoing_cb, plain_qos)
+        if self._rate_probes:
+            self._incoming_sub = self.create_subscription(
+                Image, left_topic, self._incoming_cb, plain_qos)
+            self._outgoing_sub = self.create_subscription(
+                Image, out_depth, self._outgoing_cb, plain_qos)
         self.get_logger().info(
             f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
             f'publishing: {out_depth}, {out_info}')
@@ -414,9 +421,13 @@ class S2M2DepthNode(Node):
             breakdown = ' | '.join(
                 f'{name} {self._fps_stage_acc[name] / count:.1f}/{self._fps_stage_max[name]:.1f}'
                 for name in stage_ms)
+            if self._rate_probes:
+                rate_str = (f'in {self._incoming_count / elapsed:.1f} Hz, '
+                            f'out {self._outgoing_count / elapsed:.1f} Hz, ')
+            else:
+                rate_str = ''
             self.get_logger().info(
-                f'FPS: {count / elapsed:.1f} (in {self._incoming_count / elapsed:.1f} Hz, '
-                f'out {self._outgoing_count / elapsed:.1f} Hz, {count} frames in {elapsed:.1f}s) | '
+                f'FPS: {count / elapsed:.1f} ({rate_str}{count} frames in {elapsed:.1f}s) | '
                 f'{breakdown} ms (avg/max)')
             self._fps_window_start = time.perf_counter()
             self._fps_frame_count = 0
@@ -494,11 +505,17 @@ class S2M2DepthNode(Node):
             t_exec = t_dtoh = time.perf_counter()
 
         # Outputs assumed in the order: disparity, occlusion, confidence (matches
-        # S2M2's export_tensorrt.py). Squeeze to (H, W) and copy out of the pinned
-        # buffer (astype always copies) before the next frame overwrites it.
-        disp = np.squeeze(out_buffers[0]['host']).astype(np.float32)
-        occ = np.squeeze(out_buffers[1]['host']).astype(np.float32)
-        conf = np.squeeze(out_buffers[2]['host']).astype(np.float32)
+        # S2M2's export_tensorrt.py). Squeeze to (H, W) -- view of the pinned
+        # buffer. Only cast when the engine emits something other than float32;
+        # otherwise the downstream np.divide(out=depth) reads the pinned buffer
+        # directly and finishes before the next frame's H2D begins (the stream
+        # has been synchronized above and this callback is single-threaded).
+        disp = np.squeeze(out_buffers[0]['host'])
+        occ = np.squeeze(out_buffers[1]['host'])
+        conf = np.squeeze(out_buffers[2]['host'])
+        if disp.dtype != np.float32: disp = disp.astype(np.float32)
+        if occ.dtype  != np.float32: occ  = occ.astype(np.float32)
+        if conf.dtype != np.float32: conf = conf.astype(np.float32)
         t_out = time.perf_counter()
         self._last_infer_timing = {
             'conv': (t_conv - t0) * 1e3,
