@@ -111,17 +111,6 @@ def generate_launch_description() -> LaunchDescription:
                              'Default 1/255 -> float [0,1]. Set to 1.0 for raw uint8 as float32.',
                  cli=True)
     args.add_arg('custom_device', 'cuda', choices=['cuda', 'cpu'], cli=True)
-    # Direct librealsense capture inside the depth node. See s2m2 example for
-    # caveats: vSLAM/IMU consumers won't have topics in this mode.
-    args.add_arg('custom_camera_source', 'ros', choices=['ros', 'realsense'],
-                 description='Where the depth node gets stereo frames from.',
-                 cli=True)
-    args.add_arg('custom_rs_width', 640, description='Direct-capture IR width.', cli=True)
-    args.add_arg('custom_rs_height', 480, description='Direct-capture IR height.', cli=True)
-    args.add_arg('custom_rs_fps', 30, description='Direct-capture IR FPS.', cli=True)
-    args.add_arg('custom_rs_serial', '',
-                 description='Direct-capture RealSense serial; empty = first device.',
-                 cli=True)
 
     actions = args.get_launch_actions()
 
@@ -141,14 +130,9 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     # The RealSense driver still runs in the custom path because we use its IR1/IR2
-    # streams as the stereo input to the model -- *unless* the depth node is in
-    # direct librealsense mode, in which case it owns the camera itself
-    # (librealsense allows only one process per device).
-    direct_capture = lu.is_equal(args.custom_camera_source, 'realsense')
+    # streams as the stereo input to the model.
     run_rs_driver = UnlessCondition(
-        OrSubstitution(
-            OrSubstitution(lu.is_valid(args.rosbag), lu.is_false(args.run_realsense)),
-            direct_capture))
+        OrSubstitution(lu.is_valid(args.rosbag), lu.is_false(args.run_realsense)))
     actions.append(
         lu.include(
             'nvblox_examples_bringup',
@@ -271,7 +255,6 @@ def generate_launch_description() -> LaunchDescription:
             'width', 'height',
             'baseline_m', 'confidence_threshold', 'input_scale',
             'device',
-            'camera_source', 'rs_width', 'rs_height', 'rs_fps', 'rs_serial',
         ]
         cmd = ['python3', custom_script, '--ros-args']
         for name in param_names:

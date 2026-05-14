@@ -33,7 +33,6 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
-from std_msgs.msg import Header
 from cv_bridge import CvBridge
 import message_filters
 
@@ -72,24 +71,8 @@ class CustomStereoDepthNode(Node):
         self.declare_parameter('fps_log_period', 5.0)
         self.declare_parameter('stall_warn_ms', 250.0)
         self.declare_parameter('use_cuda_graph', True)
-        # Run the disparity->depth mask+divide on the GPU instead of CPU, so
-        # only the final (H,W) depth gets D2H'd (vs disp+occ+conf D2H + CPU
-        # np.divide). Saves ~0.5-1.5 ms/frame at typical resolutions. Off if
-        # the engine doesn't emit float32 outputs or kernel compile fails.
-        self.declare_parameter('use_gpu_depth', True)
         self.declare_parameter('use_sensor_qos', False)
         self.declare_parameter('process_every_n', 1)
-        # Direct librealsense capture: skip the ROS Image subscription on the
-        # input side and pull IR1/IR2 frames straight from pyrealsense2 in this
-        # process. Requires no realsense2_camera_node running on the same
-        # device (librealsense allows one process per device). Off by default.
-        self.declare_parameter('camera_source', 'ros')         # 'ros' | 'realsense'
-        self.declare_parameter('rs_serial', '')
-        self.declare_parameter('rs_width', 640)
-        self.declare_parameter('rs_height', 480)
-        self.declare_parameter('rs_fps', 30)
-        self.declare_parameter('rs_frame_id', 'camera_infra1_optical_frame')
-        self.declare_parameter('rs_disable_emitter', True)
 
         self.cfg_width = int(self.get_parameter('width').value)
         self.cfg_height = int(self.get_parameter('height').value)
@@ -227,75 +210,13 @@ class CustomStereoDepthNode(Node):
                 f'Engine has {n_out} outputs; expected 1 (disp), 2 (disp, occ), or 3 (disp, occ, conf).')
             raise SystemExit(1)
 
-        # CUDA-graph capture of H2D->execute->(optional depth kernel)->D2H.
+        # CUDA-graph capture of H2D->execute->D2H (TRT 10+ tensor API only).
         # Valid because the page-locked host buffers and device buffers above
         # have fixed addresses for the node's lifetime; only their contents change.
         self._use_cuda_graph = (bool(self.get_parameter('use_cuda_graph').value)
                                 and self._trt_use_tensor_api)
         self._trt_graph_exec = None
         self._trt_warmup_left = 2  # TRT needs a couple of real runs before capture
-
-        # GPU disparity->depth kernel. Replaces the CPU mask + np.divide path
-        # and the D2H of disp/occ/conf with a single D2H of (H,W) depth.
-        # custom_depth_node: occ polarity is *inverted* relative to s2m2
-        # (occ > 0.5 means occluded here), and conf_thr is variable.
-        self._use_gpu_depth = bool(self.get_parameter('use_gpu_depth').value)
-        self._depth_kernel = None
-        self._depth_dev = None
-        self._depth_host = None
-        self._depth_fx_baseline_captured = None
-        if self._use_gpu_depth:
-            out_ios = [io for io in self.trt_io if not io['is_input']]
-            if any(io['dtype'] != np.float32 for io in out_ios):
-                self.get_logger().warn(
-                    'use_gpu_depth requires float32 engine outputs. '
-                    'Falling back to CPU mask path.')
-                self._use_gpu_depth = False
-            else:
-                self._n_out = len(out_ios)
-                disp_shape = out_ios[0]['shape']
-                H_out, W_out = disp_shape[-2], disp_shape[-1]
-                self._n_pixels = int(H_out * W_out)
-                self._depth_host = cuda.pagelocked_empty((H_out, W_out), np.float32)
-                self._depth_dev = cuda.mem_alloc(self._depth_host.nbytes)
-                # For absent outputs (engine emits fewer than 3), reuse the
-                # disp device pointer as a stand-in -- the kernel won't read
-                # it because has_occ / has_conf will be 0.
-                self._occ_dev_arg = out_ios[1]['dev'] if self._n_out >= 2 else out_ios[0]['dev']
-                self._conf_dev_arg = out_ios[2]['dev'] if self._n_out >= 3 else out_ios[0]['dev']
-                self._has_occ = 1 if self._n_out >= 2 else 0
-                # conf_thr <= 0 means "don't filter on confidence" in the CPU path.
-                self._has_conf_filter = 1 if (self._n_out >= 3 and self.conf_thr > 0.0) else 0
-                try:
-                    from pycuda.compiler import SourceModule
-                    _src = r"""
-                    extern "C" __global__
-                    void disp_to_depth(const float *disp, const float *occ,
-                                       const float *conf, float *depth,
-                                       float fx_baseline, float eps, float conf_thr,
-                                       int has_occ, int has_conf, int n) {
-                        int i = blockIdx.x * blockDim.x + threadIdx.x;
-                        if (i >= n) return;
-                        float d = disp[i];
-                        bool valid = d > eps;
-                        if (has_occ)  valid = valid && (occ[i]  <= 0.5f);
-                        if (has_conf) valid = valid && (conf[i] >= conf_thr);
-                        depth[i] = valid ? (fx_baseline / d) : 0.0f;
-                    }
-                    """
-                    self._depth_mod = SourceModule(_src, no_extern_c=True)
-                    self._depth_kernel = self._depth_mod.get_function('disp_to_depth')
-                    self._depth_block = (256, 1, 1)
-                    self._depth_grid = ((self._n_pixels + 255) // 256, 1, 1)
-                    self.get_logger().info(
-                        f'GPU disp->depth kernel ready (n_pixels={self._n_pixels}, '
-                        f'n_out={self._n_out}, has_occ={self._has_occ}, '
-                        f'conf_thr={self.conf_thr}).')
-                except Exception as e:
-                    self.get_logger().warn(
-                        f'GPU depth kernel compile failed ({e}); falling back to CPU mask path.')
-                    self._use_gpu_depth = False
-                    self._depth_kernel = None
 
     # --------------------------------------------------------------------- io
     def _setup_io(self):
@@ -304,11 +225,6 @@ class CustomStereoDepthNode(Node):
         info_topic = self.get_parameter('camera_info_topic').value
         out_depth = self.get_parameter('output_depth_topic').value
         out_info = self.get_parameter('output_camera_info_topic').value
-        self.camera_source = self.get_parameter('camera_source').value
-        if self.camera_source not in ('ros', 'realsense'):
-            self.get_logger().fatal(
-                f'camera_source must be "ros" or "realsense"; got "{self.camera_source}".')
-            raise SystemExit(1)
 
         # Optional sensor-data QoS (BEST_EFFORT, KEEP_LAST 5). Off by default: a
         # RELIABLE subscriber (some nvblox configs) is incompatible with a
@@ -323,99 +239,27 @@ class CustomStereoDepthNode(Node):
             pub_qos = 5
             plain_qos = 10
 
+        left_sub = message_filters.Subscriber(self, Image, left_topic, **sub_kw)
+        right_sub = message_filters.Subscriber(self, Image, right_topic, **sub_kw)
+        info_sub = message_filters.Subscriber(self, CameraInfo, info_topic, **sub_kw)
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [left_sub, right_sub, info_sub], queue_size=10, slop=0.05)
+        self.sync.registerCallback(self.on_stereo)
+
+        # Lightweight extra subscriptions purely for rate measurement, independent
+        # of `ros2 topic hz` (a separate subscriber): one on the left input image
+        # (true in-process receive rate) and one on our own depth output (rate at
+        # which published depth actually comes back through the transport).
+        self._incoming_sub = self.create_subscription(
+            Image, left_topic, self._incoming_cb, plain_qos)
+
         self.pub_depth = self.create_publisher(Image, out_depth, pub_qos)
         self.pub_info = self.create_publisher(CameraInfo, out_info, pub_qos)
-
-        if self.camera_source == 'ros':
-            left_sub = message_filters.Subscriber(self, Image, left_topic, **sub_kw)
-            right_sub = message_filters.Subscriber(self, Image, right_topic, **sub_kw)
-            info_sub = message_filters.Subscriber(self, CameraInfo, info_topic, **sub_kw)
-            self.sync = message_filters.ApproximateTimeSynchronizer(
-                [left_sub, right_sub, info_sub], queue_size=10, slop=0.05)
-            self.sync.registerCallback(self.on_stereo)
-            self._incoming_sub = self.create_subscription(
-                Image, left_topic, self._incoming_cb, plain_qos)
-            self._outgoing_sub = self.create_subscription(
-                Image, out_depth, self._outgoing_cb, plain_qos)
-            self.get_logger().info(
-                f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
-                f'publishing: {out_depth}, {out_info}')
-        else:
-            self._init_direct_camera()
-            self._outgoing_sub = self.create_subscription(
-                Image, out_depth, self._outgoing_cb, plain_qos)
-            self.get_logger().info(
-                f'direct librealsense capture; publishing: {out_depth}, {out_info}')
-
-    def _init_direct_camera(self):
-        try:
-            import pyrealsense2 as rs
-        except ImportError as e:
-            self.get_logger().fatal(
-                f'camera_source=realsense requires pyrealsense2 (`pip install pyrealsense2`): {e}')
-            raise SystemExit(1)
-        rs_width = int(self.get_parameter('rs_width').value)
-        rs_height = int(self.get_parameter('rs_height').value)
-        rs_fps = int(self.get_parameter('rs_fps').value)
-        rs_serial = self.get_parameter('rs_serial').value
-        self._rs_frame_id = self.get_parameter('rs_frame_id').value
-        disable_emitter = bool(self.get_parameter('rs_disable_emitter').value)
-
-        cfg = rs.config()
-        if rs_serial:
-            cfg.enable_device(rs_serial)
-        cfg.enable_stream(rs.stream.infrared, 1, rs_width, rs_height, rs.format.y8, rs_fps)
-        cfg.enable_stream(rs.stream.infrared, 2, rs_width, rs_height, rs.format.y8, rs_fps)
-        self._rs_pipeline = rs.pipeline()
-        profile = self._rs_pipeline.start(cfg)
-        if disable_emitter:
-            depth_sensor = profile.get_device().first_depth_sensor()
-            if depth_sensor.supports(rs.option.emitter_enabled):
-                depth_sensor.set_option(rs.option.emitter_enabled, 0)
-
-        ir1_profile = profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
-        intr = ir1_profile.get_intrinsics()
-        info = CameraInfo()
-        info.height = intr.height
-        info.width = intr.width
-        info.distortion_model = 'plumb_bob'
-        info.d = list(intr.coeffs)
-        info.k = [intr.fx, 0.0, intr.ppx,
-                  0.0, intr.fy, intr.ppy,
-                  0.0, 0.0, 1.0]
-        info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-        info.p = [intr.fx, 0.0, intr.ppx, 0.0,
-                  0.0, intr.fy, intr.ppy, 0.0,
-                  0.0, 0.0, 1.0, 0.0]
-        self._rs_info = info
+        self._outgoing_sub = self.create_subscription(
+            Image, out_depth, self._outgoing_cb, plain_qos)
         self.get_logger().info(
-            f'librealsense started: {intr.width}x{intr.height}@{rs_fps} Hz, '
-            f'fx={intr.fx:.2f} fy={intr.fy:.2f} cx={intr.ppx:.2f} cy={intr.ppy:.2f} '
-            f'emitter={"off" if disable_emitter else "on"}.')
-        self._direct_timer = self.create_timer(
-            1.0 / max(rs_fps * 4, 60), self._direct_capture_tick)
-
-    def _direct_capture_tick(self):
-        success, frames = self._rs_pipeline.try_wait_for_frames(timeout_ms=0)
-        if not success:
-            return
-        left_f = frames.get_infrared_frame(1)
-        right_f = frames.get_infrared_frame(2)
-        if not left_f or not right_f:
-            return
-        self._sync_count += 1
-        if self._process_every_n > 1 and (self._sync_count % self._process_every_n):
-            return
-        t_start = time.perf_counter()
-        left = np.asarray(left_f.get_data()).copy()
-        right = np.asarray(right_f.get_data()).copy()
-        left = _to_3channel(left)
-        right = _to_3channel(right)
-        t_decode = time.perf_counter()
-        header = Header()
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self._rs_frame_id
-        self._process_stereo(left, right, self._rs_info, header, t_start, t_decode)
+            f'subscribed: {left_topic}, {right_topic}, {info_topic}\n'
+            f'publishing: {out_depth}, {out_info}')
 
     def _incoming_cb(self, _msg: Image):
         self._incoming_count += 1
@@ -437,14 +281,7 @@ class CustomStereoDepthNode(Node):
             left = left.astype(np.uint8)
             right = right.astype(np.uint8)
         t_decode = time.perf_counter()
-        self._process_stereo(left, right, info_msg, left_msg.header, t_start, t_decode)
 
-    def _process_stereo(self, left, right, info_msg, header, t_start, t_decode):
-        """Pre/inference/post/publish for an already-decoded HxWx3 uint8 pair.
-
-        Shared between the ROS message_filters path (on_stereo) and the direct
-        librealsense capture path (_direct_capture_tick).
-        """
         h_orig, w_orig = left.shape[:2]
         if self.cfg_width and self.cfg_height:
             W, H = self.cfg_width, self.cfg_height
@@ -473,35 +310,27 @@ class CustomStereoDepthNode(Node):
         t_pre = time.perf_counter()
 
         # Inference. Each branch fills self._last_infer_timing with sub-stage ms.
-        # TRT path with use_gpu_depth=True returns depth directly (occ/conf are
-        # consumed inside the GPU kernel and never D2H'd). ONNX path and TRT
-        # fallback path still return (disp, occ, conf).
-        gpu_depth_used = (self.backend == 'trt' and self._use_gpu_depth)
         if self.backend == 'onnx':
             disp, occ, conf = self._onnx_infer(left_np, right_np)
         else:
-            fx_baseline = float(info_msg.k[0]) * sx * self.baseline_m
-            disp, occ, conf = self._trt_infer(left_np, right_np, fx_baseline)
+            disp, occ, conf = self._trt_infer(left_np, right_np)
         t_infer = time.perf_counter()
 
-        if gpu_depth_used:
-            # GPU kernel already produced depth in self._depth_host.
-            depth = disp
-        else:
-            # Disparity -> depth at the inference resolution. One pass: build the
-            # valid mask (incl. optional occ/conf) once, then divide into a pre-zeroed
-            # buffer. occ is masked-out where occ > 0.5; conf where conf < conf_thr.
-            fx_used = float(info_msg.k[0]) * sx
-            valid = disp > 1e-3
-            if occ is not None:
-                valid &= (occ <= 0.5)
-            if conf is not None and self.conf_thr > 0.0:
-                valid &= (conf >= self.conf_thr)
-            if self._depth_buf is None or self._depth_buf.shape != disp.shape:
-                self._depth_buf = np.zeros(disp.shape, dtype=np.float32)
-            depth = self._depth_buf
-            depth.fill(0.0)
-            np.divide(fx_used * self.baseline_m, disp, out=depth, where=valid)
+        # Disparity -> depth at the inference resolution. One pass: build the
+        # valid mask (incl. optional occ/conf) once, then divide into a pre-zeroed
+        # buffer. Same final result as the previous gather/scatter + masking
+        # (occ is masked-out where occ > 0.5; conf where conf < conf_thr).
+        fx_used = float(info_msg.k[0]) * sx
+        valid = disp > 1e-3
+        if occ is not None:
+            valid &= (occ <= 0.5)
+        if conf is not None and self.conf_thr > 0.0:
+            valid &= (conf >= self.conf_thr)
+        if self._depth_buf is None or self._depth_buf.shape != disp.shape:
+            self._depth_buf = np.zeros(disp.shape, dtype=np.float32)
+        depth = self._depth_buf
+        depth.fill(0.0)
+        np.divide(fx_used * self.baseline_m, disp, out=depth, where=valid)
 
         # Restore to original dimensions.
         if mode == 'resize':
@@ -524,7 +353,7 @@ class CustomStereoDepthNode(Node):
         depth_msg.height = depth_full.shape[0]
         depth_msg.width = depth_full.shape[1]
         depth_msg.step = depth_full.shape[1] * 4
-        depth_msg.header = header
+        depth_msg.header = left_msg.header
         depth_msg.data = depth_full.tobytes()
         self.pub_depth.publish(depth_msg)
 
@@ -543,7 +372,7 @@ class CustomStereoDepthNode(Node):
             info_out.binning_y = info_msg.binning_y
             info_out.roi = info_msg.roi
             self._info_out = info_out
-        self._info_out.header = header
+        self._info_out.header = left_msg.header
         self.pub_info.publish(self._info_out)
         t_pub = time.perf_counter()
 
@@ -614,31 +443,16 @@ class CustomStereoDepthNode(Node):
         return disp, occ, conf
 
     # ----------------------------------------------------------------- trt fn
-    def _launch_depth_kernel(self, out_buffers, fx_baseline, stream):
-        """Launch disp->depth kernel reading TRT output device buffers."""
-        self._depth_kernel(
-            out_buffers[0]['dev'], self._occ_dev_arg, self._conf_dev_arg,
-            self._depth_dev,
-            np.float32(fx_baseline), np.float32(1e-3), np.float32(self.conf_thr),
-            np.int32(self._has_occ), np.int32(self._has_conf_filter),
-            np.int32(self._n_pixels),
-            block=self._depth_block, grid=self._depth_grid, stream=stream)
-
-    def _enqueue_trt_async(self, in_buffers, out_buffers, fx_baseline=0.0):
-        """H2D copies -> execute -> [depth kernel] -> D2H, on self._trt_stream."""
+    def _enqueue_trt_async(self, in_buffers, out_buffers):
+        """H2D copies -> execute -> D2H copies, all enqueued on self._trt_stream."""
         stream = self._trt_stream
         for io in in_buffers:
             self._cuda.memcpy_htod_async(io['dev'], io['host'], stream)
         self.trt_context.execute_async_v3(stream.handle)
-        if self._use_gpu_depth:
-            self._launch_depth_kernel(out_buffers, fx_baseline, stream)
-            self._cuda.memcpy_dtoh_async(self._depth_host, self._depth_dev, stream)
-        else:
-            for io in out_buffers:
-                self._cuda.memcpy_dtoh_async(io['host'], io['dev'], stream)
+        for io in out_buffers:
+            self._cuda.memcpy_dtoh_async(io['host'], io['dev'], stream)
 
-    def _trt_infer(self, left_np: np.ndarray, right_np: np.ndarray,
-                   fx_baseline: float = 0.0):
+    def _trt_infer(self, left_np: np.ndarray, right_np: np.ndarray):
         in_buffers = [io for io in self.trt_io if io['is_input']]
         out_buffers = [io for io in self.trt_io if not io['is_input']]
         t0 = time.perf_counter()
@@ -651,37 +465,29 @@ class CustomStereoDepthNode(Node):
         t_conv = time.perf_counter()
 
         if self._trt_stream is None:
-            # Legacy TRT<=9 path: synchronous binding API.
+            # Legacy TRT<=9 path: synchronous binding API, unchanged behaviour.
             for io in in_buffers:
                 self._cuda.memcpy_htod(io['dev'], io['host'])
             t_htod = time.perf_counter()
             self.trt_context.execute_v2(self.trt_bindings)
             t_exec = time.perf_counter()
-            if self._use_gpu_depth:
-                self._launch_depth_kernel(out_buffers, fx_baseline, None)
-                self._cuda.memcpy_dtoh(self._depth_host, self._depth_dev)
-            else:
-                for io in out_buffers:
-                    self._cuda.memcpy_dtoh(io['host'], io['dev'])
+            for io in out_buffers:
+                self._cuda.memcpy_dtoh(io['host'], io['dev'])
             t_dtoh = time.perf_counter()
         else:
             stream = self._trt_stream
             if not self._use_cuda_graph or self._trt_warmup_left > 0:
-                self._enqueue_trt_async(in_buffers, out_buffers, fx_baseline)
+                self._enqueue_trt_async(in_buffers, out_buffers)
                 if self._trt_warmup_left > 0:
                     self._trt_warmup_left -= 1
             elif self._trt_graph_exec is None:
                 try:
                     stream.begin_capture()
-                    self._enqueue_trt_async(in_buffers, out_buffers, fx_baseline)
+                    self._enqueue_trt_async(in_buffers, out_buffers)
                     graph = stream.end_capture()
                     self._trt_graph_exec = graph.instantiate()
                     self._trt_graph_exec.launch(stream)
-                    if self._use_gpu_depth:
-                        self._depth_fx_baseline_captured = float(fx_baseline)
-                    self.get_logger().info(
-                        f'CUDA graph captured for TRT inference '
-                        f'(gpu_depth={self._use_gpu_depth}).')
+                    self.get_logger().info('CUDA graph captured for TRT inference.')
                 except Exception as e:  # pycuda graph API varies; degrade gracefully
                     self._use_cuda_graph = False
                     self._trt_graph_exec = None
@@ -691,35 +497,12 @@ class CustomStereoDepthNode(Node):
                         pass
                     self.get_logger().warn(
                         f'CUDA graph capture failed ({e}); using plain async enqueue.')
-                    self._enqueue_trt_async(in_buffers, out_buffers, fx_baseline)
+                    self._enqueue_trt_async(in_buffers, out_buffers)
             else:
-                if (self._use_gpu_depth
-                        and self._depth_fx_baseline_captured is not None
-                        and abs(fx_baseline - self._depth_fx_baseline_captured) > 1e-3
-                        and not getattr(self, '_warned_fx_change', False)):
-                    self.get_logger().warn(
-                        f'fx_baseline changed after CUDA graph capture '
-                        f'({self._depth_fx_baseline_captured:.4f} -> {fx_baseline:.4f}); '
-                        f'GPU depth will use the captured value.')
-                    self._warned_fx_change = True
                 self._trt_graph_exec.launch(stream)
             t_htod = t_conv  # async: H2D/exec/D2H overlap on the stream
             stream.synchronize()
             t_exec = t_dtoh = time.perf_counter()
-
-        if self._use_gpu_depth:
-            # Depth already computed on GPU and D2H'd into the pinned buffer.
-            # Returning (depth, None, None) signals the caller to skip CPU mask.
-            depth = self._depth_host
-            t_out = time.perf_counter()
-            self._last_infer_timing = {
-                'conv': (t_conv - t0) * 1e3,
-                'htod': (t_htod - t_conv) * 1e3,
-                'exec': (t_exec - t_htod) * 1e3,
-                'dtoh': (t_dtoh - t_exec) * 1e3,
-                'out': (t_out - t_dtoh) * 1e3,
-            }
-            return depth, None, None
 
         disp = np.squeeze(out_buffers[0]['host']).astype(np.float32)
         occ = np.squeeze(out_buffers[1]['host']).astype(np.float32) if len(out_buffers) > 1 else None

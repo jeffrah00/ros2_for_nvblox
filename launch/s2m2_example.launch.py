@@ -126,20 +126,6 @@ def generate_launch_description() -> LaunchDescription:
                              '(disparity error >= 4 px).',
                  cli=True)
     args.add_arg('s2m2_device', 'cuda', choices=['cuda', 'cpu'], cli=True)
-    # Direct librealsense capture inside the depth node. When set to 'realsense',
-    # the depth node opens the camera via pyrealsense2 directly and the launch
-    # file skips the realsense2_camera include (librealsense allows only one
-    # process per device). Note: in this mode vSLAM and IMU consumers won't
-    # have IR/IMU topics; use camera_source=ros for the full nvblox pipeline.
-    args.add_arg('s2m2_camera_source', 'ros', choices=['ros', 'realsense'],
-                 description='Where the depth node gets stereo frames from.',
-                 cli=True)
-    args.add_arg('s2m2_rs_width', 640, description='Direct-capture IR width.', cli=True)
-    args.add_arg('s2m2_rs_height', 480, description='Direct-capture IR height.', cli=True)
-    args.add_arg('s2m2_rs_fps', 30, description='Direct-capture IR FPS.', cli=True)
-    args.add_arg('s2m2_rs_serial', '',
-                 description='Direct-capture RealSense serial; empty = first device.',
-                 cli=True)
 
     actions = args.get_launch_actions()
 
@@ -162,14 +148,9 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     # The RealSense driver still runs in the s2m2 path because we use its IR1/IR2
-    # streams as the stereo input to S2M2 -- *unless* the depth node is in
-    # direct librealsense mode, in which case it owns the camera itself
-    # (librealsense allows only one process per device).
-    direct_capture = lu.is_equal(args.s2m2_camera_source, 'realsense')
+    # streams as the stereo input to S2M2.
     run_rs_driver = UnlessCondition(
-        OrSubstitution(
-            OrSubstitution(lu.is_valid(args.rosbag), lu.is_false(args.run_realsense)),
-            direct_capture))
+        OrSubstitution(lu.is_valid(args.rosbag), lu.is_false(args.run_realsense)))
     # Realsense
     actions.append(
         lu.include(
@@ -302,7 +283,6 @@ def generate_launch_description() -> LaunchDescription:
             'output_depth_topic', 'output_camera_info_topic',
             'width', 'height', 'baseline_m', 'mask_occluded',
             'mask_low_confidence', 'device',
-            'camera_source', 'rs_width', 'rs_height', 'rs_fps', 'rs_serial',
         ]
         cmd = ['python3', s2m2_script, '--ros-args']
         for name in param_names:
