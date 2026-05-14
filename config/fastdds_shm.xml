@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+Fast DDS profile for large same-host depth payloads.
+
+Default Fast DDS SHM segment is ~512 KB; our 640x480 32FC1 depth message is
+~1.2 MB, so a default-sized SHM segment cannot hold it whole and Fast DDS
+falls back to UDPv4 loopback with fragmentation. Bumping segment_size and
+maxMessageSize lets the depth message ride entirely in shared memory.
+
+UDPv4 stays in userTransports as a fallback for any cross-host subscribers.
+Same-host participants will pick SHM first.
+
+Point Fast DDS at this file with:
+    export FASTRTPS_DEFAULT_PROFILES_FILE=/abs/path/to/fastdds_shm.xml
+
+Confirm it took effect by watching for a "Loading XML file" log line from
+Fast DDS at startup, or `ros2 topic hz` on the depth topic matching the
+node-internal publish rate.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>shm_transport</transport_id>
+      <type>SHM</type>
+      <!-- 8 MB segment holds ~6 of our 1.2 MB depth msgs without fragmentation. -->
+      <segment_size>8388608</segment_size>
+      <!-- Depth peaks ~30 Hz; 64 slots = >2 s of history. -->
+      <port_queue_capacity>64</port_queue_capacity>
+      <!-- Allow a single SHM block to carry the whole depth message. -->
+      <maxMessageSize>4194304</maxMessageSize>
+    </transport_descriptor>
+    <transport_descriptor>
+      <transport_id>udpv4_fallback</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+
+  <participant profile_name="participant_default" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>shm_transport</transport_id>
+        <transport_id>udpv4_fallback</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

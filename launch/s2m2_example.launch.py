@@ -20,7 +20,7 @@ import os
 from isaac_ros_launch_utils.all_types import *
 import isaac_ros_launch_utils as lu
 
-from launch.actions import GroupAction, ExecuteProcess, OpaqueFunction
+from launch.actions import GroupAction, ExecuteProcess, OpaqueFunction, SetEnvironmentVariable
 from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import SetRemap
@@ -127,7 +127,26 @@ def generate_launch_description() -> LaunchDescription:
                  cli=True)
     args.add_arg('s2m2_device', 'cuda', choices=['cuda', 'cpu'], cli=True)
 
+    # Fast DDS shared-memory profile: enlarges the SHM segment so 1.2 MB depth
+    # msgs ride in shared memory instead of falling back to fragmented UDPv4
+    # loopback. Same-host only; UDPv4 stays as fallback for cross-host subs.
+    args.add_arg(
+        's2m2_use_shm_profile', True,
+        description='Point Fast DDS at config/fastdds_shm.xml so large depth '
+                    'msgs stay in shared memory. Fast DDS RMW only.',
+        cli=True)
+
     actions = args.get_launch_actions()
+
+    # Must be appended before any include / component_container so child
+    # processes inherit the env var. Does not override a value already set
+    # in the user's shell.
+    shm_profile_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', 'config', 'fastdds_shm.xml'))
+    actions.append(SetEnvironmentVariable(
+        name='FASTRTPS_DEFAULT_PROFILES_FILE',
+        value=shm_profile_path,
+        condition=IfCondition(args.s2m2_use_shm_profile)))
 
     # Globally set use_sim_time if we're running from bag or sim
     actions.append(

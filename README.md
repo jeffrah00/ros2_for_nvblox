@@ -142,6 +142,16 @@ The generic node assumes the model takes **two inputs** `(1, 3, H, W)` (left, ri
 
 Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/depth/camera_info`; nvblox is remapped to those via the launch file's `SetRemap`. All other launch args mirror the S2M2 example with a `custom_` prefix instead of `s2m2_`.
 
+## Fast DDS shared-memory profile
+
+A 640×480 `32FC1` depth message is ~1.2 MB. Fast DDS's default SHM segment is ~512 KB, so anything that doesn't fit falls back to fragmented UDPv4 loopback — visible as the depth topic running 5–10 Hz below the camera_info topic published right after it in the same callback.
+
+All three launch files set `FASTRTPS_DEFAULT_PROFILES_FILE` to `config/fastdds_shm.xml` by default, which bumps the SHM segment to 8 MB and keeps UDPv4 as a cross-host fallback. Same-host subscribers (vSLAM, nvblox, RViz on the same machine) pick SHM first, no fragmentation.
+
+- Disable per-launch: `s2m2_use_shm_profile:=false` (or `custom_use_shm_profile:=false`, `use_shm_profile:=false` for the RealSense example).
+- Only affects Fast DDS (`rmw_fastrtps_cpp`), the ROS 2 Jazzy default. CycloneDDS users need to enable Iceoryx in their own `CYCLONEDDS_URI` config.
+- Confirm it's active: look for a `Loading XML file ...` line from Fast DDS at startup, or check that `ros2 topic hz /s2m2/depth/image_rect_raw` matches the depth node's internal `out` rate.
+
 ## Troubleshooting
 
 - **All-zero or wildly wrong depth** — set `s2m2_baseline_m` to your actual stereo baseline in meters. The left CameraInfo's projection matrix typically does not encode it.
@@ -149,3 +159,4 @@ Defaults publish to `/custom_depth/depth/image_rect_raw` and `/custom_depth/dept
 - **TensorRT shape mismatch** — re-export the engine at the exact `s2m2_height`/`s2m2_width` you launch with.
 - **nvblox reports no depth** — confirm the launch file's `SetRemap` source (`/camera0/depth/image_rect_raw`) matches your nvblox version's expected depth topic. The S2M2 node publishes to `/s2m2/depth/...` and the remap routes nvblox to it; override `s2m2_output_depth_topic` / `s2m2_output_camera_info_topic` to publish under a different name.
 - **Sync drops** — loosen the `ApproximateTimeSynchronizer` slop in `scripts/s2m2_depth_node.py` (or `scripts/custom_depth_node.py`) or align timestamps in your bag.
+- **Depth topic lags camera_info under `ros2 topic hz`** — Fast DDS SHM fragmentation on 1.2 MB depth payloads; see the section above.
