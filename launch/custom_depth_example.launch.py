@@ -22,7 +22,7 @@ import os
 from isaac_ros_launch_utils.all_types import *
 import isaac_ros_launch_utils as lu
 
-from launch.actions import GroupAction, ExecuteProcess, OpaqueFunction
+from launch.actions import GroupAction, ExecuteProcess, OpaqueFunction, SetEnvironmentVariable
 from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import SetRemap
@@ -112,7 +112,22 @@ def generate_launch_description() -> LaunchDescription:
                  cli=True)
     args.add_arg('custom_device', 'cuda', choices=['cuda', 'cpu'], cli=True)
 
+    # Fast DDS shared-memory profile: see config/fastdds_shm.xml. Keeps large
+    # depth msgs in shared memory instead of fragmented UDPv4 loopback.
+    args.add_arg(
+        'custom_use_shm_profile', True,
+        description='Point Fast DDS at config/fastdds_shm.xml so large depth '
+                    'msgs stay in shared memory. Fast DDS RMW only.',
+        cli=True)
+
     actions = args.get_launch_actions()
+
+    shm_profile_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', 'config', 'fastdds_shm.xml'))
+    actions.append(SetEnvironmentVariable(
+        name='FASTRTPS_DEFAULT_PROFILES_FILE',
+        value=shm_profile_path,
+        condition=IfCondition(args.custom_use_shm_profile)))
 
     actions.append(
         SetParameter('use_sim_time', True, condition=IfCondition(lu.is_valid(args.rosbag))))
